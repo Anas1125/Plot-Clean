@@ -349,7 +349,9 @@
       return;
     }
     const p = pin.piece, n = pin.pts.length;
-    if (n % 2 === 0) {                                                // a spot on the piece, in the piece's own (picture-pixel) units
+    // clicks alternate piece, background, piece, background.  A spot on the piece starts a new pair; a pair that
+    // has no background spot yet receives this click.  (n is the number of pairs, not clicks, so n % 2 was wrong.)
+    if (n === 0 || pin.pts[n - 1].t) {                                // a spot on the piece, in the piece's own (picture-pixel) units
       const a = pin.pose.rot * Math.PI / 180, dx = wx - pin.pose.x, dy = wy - pin.pose.y;
       pin.pts.push({ q: [(Math.cos(a) * dx + Math.sin(a) * dy) / pin.pose.mpp, (-Math.sin(a) * dx + Math.cos(a) * dy) / pin.pose.mpp], w: [wx, wy] });
     } else { pin.pts[n - 1].t = [wx, wy]; }
