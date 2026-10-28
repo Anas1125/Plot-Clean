@@ -4,3 +4,4 @@ venv/
 .venv/
 .env
 .DS_Store
+approved_images/ 
