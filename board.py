@@ -482,6 +482,7 @@ def register(app, approved_records, approved_dir, puzzle_dir):
             out.append({'id': p['id'], 'name': p['name'], 'survey': p['survey'], 'w': p['w'], 'h': p['h'],
                         'mpp': p['mpp'], 'poly': p['poly'], 'tag': p['tag'], 'tag_r': p['tag_r'],
                         'scale_known': p['scale_known'], 'saved': 'x' in lay,
+                        'sz_saved': lay.get('sz'),
                         'placed': bool(lay.get('placed', 'x' in lay)),
                         'locked': bool(lay.get('locked', False)),
                         'color': lay.get('color') or color_for(order.get(p['id'], i)),
@@ -512,6 +513,8 @@ def register(app, approved_records, approved_dir, puzzle_dir):
                 entry = layout.setdefault(str(pid), {})
                 entry['x'], entry['y'] = float(v['x']), float(v['y'])
                 entry['rot'] = float(v.get('rot', 0.0))
+                if v.get('sz') is not None:
+                    entry['sz'] = float(v['sz'])
                 if 'placed' in v:
                     entry['placed'] = bool(v['placed'])
                 if 'locked' in v:

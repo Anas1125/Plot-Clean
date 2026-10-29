@@ -284,7 +284,9 @@
   }
   function updateBgUI() {
     if (bgAdjBtn) {
-      bgAdjBtn.disabled = !bg; bgAdjBtn.textContent = bgAdjust ? '✔ Done moving' : 'Move background';
+      bgAdjBtn.disabled = !bg; bgAdjBtn.textContent = bgAdjust ? '✔ Done moving' : '✥ Move background'; bgAdjBtn.classList.toggle('on', bgAdjust);
+      if (bgScaleBtn) bgScaleBtn.disabled = !bg;
+      if (fitBtn2) fitBtn2.disabled = !bg; if (fitSel) fitSel.disabled = !bg;
       bgAdjBtn.title = 'Drag = move, mouse wheel = resize, Shift+wheel = rotate';
     }
     if (bgOpacity) { bgOpacity.disabled = !bg; if (bg) bgOpacity.value = Math.round(bg.opacity * 100); }
@@ -606,6 +608,103 @@
     }
     ctx.restore();
   }
+  // ------------------------------------------------------------------ fit check against the background
+  // Every piece outline is walked in small steps; a step is "good" when a dark line of the background picture lies
+  // within a few picture pixels of it. Stretches with no line under them are drawn in red, and a piece where less
+  // than FIT_BAD of the outline sits on a line gets a red tint and a % badge.
+  let fitOn = false, fitTolPx = 8, fitBtn2, fitSel, ink = null;
+  const FIT_BAD = 0.6;
+  let fitTimer = 0;
+  const fitBlink = () => 0.15 + 0.85 * (0.5 + 0.5 * Math.sin(performance.now() / 1000 * Math.PI * 2 * 1.5));   // ~1.5 blinks per second
+  function fitAnimate(on) { clearInterval(fitTimer); fitTimer = on ? setInterval(schedule, 50) : 0; }
+  function buildInk() {
+    if (!bg || !bgImg || !bgImg.complete || !bgImg.naturalWidth) return null;
+    if (ink && ink.src === bgImg) return ink;
+    const s = Math.min(1, 2400 / Math.max(bg.w, bg.h)), dw = Math.max(1, Math.round(bg.w * s)), dh = Math.max(1, Math.round(bg.h * s));
+    const cv = document.createElement('canvas'); cv.width = dw; cv.height = dh;
+    const g = cv.getContext('2d', { willReadFrequently: true });
+    g.fillStyle = '#fff'; g.fillRect(0, 0, dw, dh); g.drawImage(bgImg, 0, 0, dw, dh);
+    let data; try { data = g.getImageData(0, 0, dw, dh).data; } catch (e) { return null; }
+    const INF = 1e9, d = new Float32Array(dw * dh);
+    for (let i = 0; i < d.length; i++) { const j = i * 4; d[i] = (0.299 * data[j] + 0.587 * data[j + 1] + 0.114 * data[j + 2]) < 130 ? 0 : INF; }
+    const A = 1, B = 1.4142;                                    // two-pass chamfer distance to the nearest dark pixel
+    for (let y = 0; y < dh; y++) for (let x = 0; x < dw; x++) {
+      const i = y * dw + x; let v = d[i];
+      if (x > 0) v = Math.min(v, d[i - 1] + A);
+      if (y > 0) { v = Math.min(v, d[i - dw] + A); if (x > 0) v = Math.min(v, d[i - dw - 1] + B); if (x < dw - 1) v = Math.min(v, d[i - dw + 1] + B); }
+      d[i] = v;
+    }
+    for (let y = dh - 1; y >= 0; y--) for (let x = dw - 1; x >= 0; x--) {
+      const i = y * dw + x; let v = d[i];
+      if (x < dw - 1) v = Math.min(v, d[i + 1] + A);
+      if (y < dh - 1) { v = Math.min(v, d[i + dw] + A); if (x < dw - 1) v = Math.min(v, d[i + dw + 1] + B); if (x > 0) v = Math.min(v, d[i + dw - 1] + B); }
+      d[i] = v;
+    }
+    ink = { src: bgImg, s, dw, dh, d };
+    return ink;
+  }
+  function inkDist(u, v) {                                      // picture px -> distance (picture px) to the nearest line, -1 = outside the picture
+    const x = Math.round(u * ink.s), y = Math.round(v * ink.s);
+    if (x < 0 || y < 0 || x >= ink.dw || y >= ink.dh) return -1;
+    return ink.d[y * ink.dw + x] / ink.s;
+  }
+  function fitOf(p) {
+    if (!buildInk()) return null;
+    const key = [p.x, p.y, p.rot, p.mpp, bg.x, bg.y, bg.mpp, bg.rot, fitTolPx].join('|');
+    if (p._fit && p._fit.key === key) return p._fit;
+    const a = p.rot * Math.PI / 180, c = Math.cos(a), s = Math.sin(a), b = -bg.rot * Math.PI / 180, cb = Math.cos(b), sb = Math.sin(b);
+    const P = p.poly, stepW = bg.mpp * 4, st = [];
+    for (let i = 0; i < P.length; i++) {
+      const A = P[i], B = P[(i + 1) % P.length];
+      const n = Math.max(1, Math.min(400, Math.ceil(Math.hypot(B[0] - A[0], B[1] - A[1]) * p.mpp / stepW)));
+      for (let k = 0; k < n; k++) {
+        const t = k / n, x = (A[0] + (B[0] - A[0]) * t) * p.mpp, y = (A[1] + (B[1] - A[1]) * t) * p.mpp;
+        const wx = c * x - s * y + p.x, wy = s * x + c * y + p.y, dx = wx - bg.x, dy = wy - bg.y;
+        const d = inkDist((cb * dx - sb * dy) / bg.mpp, (sb * dx + cb * dy) / bg.mpp);
+        st.push({ wx, wy, ok: d < 0 ? null : d <= fitTolPx });
+      }
+    }
+    let good = 0, valid = 0; const runs = []; let run = [];
+    const flush = () => { if (run.length >= 3) runs.push(run); run = []; };
+    for (const q of st) {
+      if (q.ok === null) { flush(); continue; }
+      valid++;
+      if (q.ok) { good++; flush(); } else run.push([q.wx, q.wy]);
+    }
+    flush();
+    p._fit = { key, score: valid >= 10 ? good / valid : null, runs };
+    return p._fit;
+  }
+  function drawFit(p) {
+    const f = fitOf(p); if (!f) return;
+    if (f.score != null && f.score < FIT_BAD) {
+      ctx.save(); ctx.translate(view.ox + p.x * view.k, view.oy + p.y * view.k); ctx.rotate(p.rot * Math.PI / 180);
+      const sc = p.mpp * view.k; ctx.scale(sc, sc); pathPoly(p); ctx.globalAlpha = fitBlink(); ctx.fillStyle = 'rgba(230,0,0,.28)'; ctx.fill(); ctx.restore();
+    }
+    ctx.save(); ctx.globalAlpha = fitBlink(); ctx.lineJoin = 'round'; ctx.lineCap = 'round'; ctx.strokeStyle = '#e00000'; ctx.lineWidth = 4;
+    for (const r of f.runs) { ctx.beginPath(); r.forEach(([wx, wy], i) => { const [sx, sy] = toScreen(wx, wy); i ? ctx.lineTo(sx, sy) : ctx.moveTo(sx, sy); }); ctx.stroke(); }
+    ctx.restore();
+    if (f.score != null && f.score < FIT_BAD) {
+      const a = p.rot * Math.PI / 180, cc = Math.cos(a), ss = Math.sin(a), lp = p.ctr || p.tag, lx = lp[0] * p.mpp, ly = lp[1] * p.mpp;
+      const [sx, sy] = toScreen(cc * lx - ss * ly + p.x, ss * lx + cc * ly + p.y);
+      const size = Math.max(10, Math.min(34, p.tag_r * p.mpp * view.k * 0.62));
+      ctx.font = `700 ${Math.max(10, size * 0.7)}px system-ui, sans-serif`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle';
+      ctx.save(); ctx.globalAlpha = fitBlink();
+      const t = '⚠ ' + Math.round(f.score * 100) + '%';
+      ctx.lineWidth = 4; ctx.strokeStyle = 'rgba(255,255,255,.95)'; ctx.strokeText(t, sx, sy + size * 0.95);
+      ctx.fillStyle = '#e00000'; ctx.fillText(t, sx, sy + size * 0.95);
+      ctx.restore();
+    }
+  }
+  function fitReport() {
+    if (!buildInk()) { setStatus('Fit check: could not read the background picture yet. Try again in a moment.', 'error'); return; }
+    const rows = pieces.map(p => [p, fitOf(p)]).filter(([, f]) => f && f.score != null);
+    const bad = rows.filter(([, f]) => f.score < FIT_BAD).sort((x, y) => x[1].score - y[1].score);
+    setStatus(bad.length
+      ? `Fit check: ${bad.length} of ${rows.length} piece(s) do not follow the background lines (red). Worst: ` + bad.slice(0, 10).map(([p, f]) => `S.${p.survey} ${Math.round(f.score * 100)}%`).join(', ') + (bad.length > 10 ? '…' : '') + '. Red stretches show where the outline leaves the lines.'
+      : `Fit check: all ${rows.length} piece(s) follow the background lines.`, bad.length ? 'error' : 'good');
+  }
+
   function drawLabel(p) {
     const a = p.rot * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
     const lp = p.ctr || p.tag, lx = lp[0] * p.mpp, ly = lp[1] * p.mpp;
@@ -629,6 +728,7 @@
       vis.push(p); drawPiece(p, false);
     }
     if (snapTarget && drag && drag.moved) drawPiece(snapTarget, true);
+    if (fitOn && bg) for (const p of vis) drawFit(p);
     for (const p of vis) drawLabel(p);
     drawPins();
   }
@@ -749,7 +849,7 @@
 
   // ------------------------------------------------------------------ data
   function addPiece(d) {
-    const sz = savedSizes[d.id] || 1;
+    const sz = d.sz_saved || savedSizes[d.id] || 1;
     const p = Object.assign({}, d, { imgUrl: d.img, img: null, loaded: false, mpp0: d.mpp, sz, mpp: d.mpp * sz });
     p.ctr = visualCentre(p.poly);
     refresh(p); return p;
@@ -772,6 +872,7 @@
         if (bad) msg += ` ${bad} sheet(s) could not be read.`;
         setStatus(msg, bad ? 'error' : '');
         if (!keepView) fit();
+        all.forEach(p => { if (p.sz_saved == null && Math.abs(p.sz - 1) > 1e-6) dirty.add(p.id); }); if (dirty.size) flushSave();
         if (all.some(p => !p.saved)) { all.forEach(p => dirty.add(p.id)); flushSave(); all.forEach(p => p.saved = true); }
         renderTray();
         autoBtn.disabled = false; updateSel(); schedule(); if (!bg) bgLoad(); break;
@@ -782,7 +883,7 @@
   function flushSave() {
     clearTimeout(saveTimer);
     const body = {};
-    for (const id of dirty) { const p = pieces.find(q => q.id === id) || tray.find(q => q.id === id); if (p) body[id] = { x: p.x, y: p.y, rot: p.rot, color: p.color, placed: p.placed !== false, locked: !!p.locked }; }
+    for (const id of dirty) { const p = pieces.find(q => q.id === id) || tray.find(q => q.id === id); if (p) body[id] = { x: p.x, y: p.y, rot: p.rot, sz: p.sz, color: p.color, placed: p.placed !== false, locked: !!p.locked }; }
     dirty.clear();
     if (!Object.keys(body).length) return;
     fetch('/api/board/layout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pieces: body }) })
@@ -827,8 +928,8 @@
   let boardLocked = (() => { try { return localStorage.getItem(LOCK_KEY) === '1'; } catch (e) { return false; } })();
   function updateLockUI() {
     if (lockBtn) {
-      lockBtn.textContent = boardLocked ? '🔒 Locked' : '🔓 Unlocked';
-      lockBtn.title = boardLocked ? 'Board is locked: click to unlock (key L)' : 'Lock the whole board so nothing can be moved (key L)';
+      lockBtn.textContent = boardLocked ? '🔒 Unlock board' : '🔓 Lock board'; lockBtn.classList.toggle('on', boardLocked);
+      lockBtn.title = boardLocked ? 'The board is LOCKED: nothing can be moved. Click to unlock (key L)' : 'Lock the whole board so nothing can be moved by accident (key L)';
     }
     if (wrap) wrap.classList.toggle('locked', boardLocked);
   }
@@ -854,6 +955,7 @@
   function rememberSize(p) {
     if (Math.abs(p.sz - 1) < 1e-6) delete savedSizes[p.id]; else savedSizes[p.id] = p.sz;
     try { localStorage.setItem(SIZE_KEY, JSON.stringify(savedSizes)); } catch (e) { /* storage unavailable */ }
+    queueSave(p);
   }
   // resize about the piece's own centre, so it grows or shrinks in place
   function setSize(p, f) {
@@ -905,7 +1007,7 @@
   function updateSel() {
     if (!selected) { selBar.classList.add('hidden'); return; }
     selBar.classList.remove('hidden');
-    if (pieceLockBtn) pieceLockBtn.textContent = selected.locked ? '🔒 Unlock piece' : '🔓 Lock piece';
+    if (pieceLockBtn) { pieceLockBtn.textContent = selected.locked ? '🔒 Unlock piece' : '🔓 Lock piece'; pieceLockBtn.classList.toggle('on', !!selected.locked); }
     selName.textContent = 'S.' + selected.survey + ' · ' + (selected.name || '');
     selColor.value = selected.color;
     if (selSize) selSize.value = selected.sz.toFixed(2);
@@ -1129,9 +1231,21 @@
   function build() {
     root = document.getElementById('board-root'); if (!root) return false;
     const style = el('style'); style.textContent = `
-      #board-root .bar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:8px 0}
-      #board-root .bar button{padding:6px 12px}
-      #board-root .bar label{font-size:14px;display:flex;gap:6px;align-items:center}
+      #board-root .bar{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap;margin:10px 0}
+      #board-root .grp{display:flex;gap:6px;align-items:center;flex-wrap:wrap;position:relative;padding:22px 10px 9px;background:#fff;border:1px solid #d5d9df;border-radius:10px}
+      #board-root .grp .gt{position:absolute;top:6px;left:11px;font-size:10px;font-weight:700;letter-spacing:.07em;text-transform:uppercase;color:#6b7280}
+      #board-root .bar label,#board-root .sel label{font-size:13px;display:flex;gap:6px;align-items:center;color:#1f2933}
+      #board-root .bar select,#board-root .sel select{padding:5px 6px;font-size:13px;border:1px solid #cfd4db;border-radius:8px;background:#fff}
+      #board-root .bar button,#board-root .sel button{padding:6px 11px;font-size:13px;line-height:1.2;color:#1f2933;background:#fff;border:1px solid #cfd4db;border-radius:8px;cursor:pointer;white-space:nowrap}
+      #board-root .bar button:hover:not(:disabled),#board-root .sel button:hover:not(:disabled){background:#f1f5fb;border-color:#0b6bcb}
+      #board-root .bar button:disabled,#board-root .sel button:disabled{opacity:.4;cursor:not-allowed}
+      #board-root button.b-pri{background:#0b6bcb;border-color:#0b6bcb;color:#fff;font-weight:600}
+      #board-root .bar button.b-pri:hover:not(:disabled){background:#0957a6;border-color:#0957a6}
+      #board-root button.b-danger{color:#c62828;border-color:#e6b8b8}
+      #board-root .bar button.b-danger:hover:not(:disabled){background:#fdecea;border-color:#c62828}
+      #board-root button.on{background:#e8f1fc;border-color:#0b6bcb;color:#0b4f96;font-weight:600}
+      #board-root button.lock.on{background:#fdecea;border-color:#c62828;color:#c62828}
+      #board-root .status{margin:6px 0}
       #board-root .stage{display:flex;gap:8px;align-items:stretch}
       #board-root:fullscreen{background:#fff;padding:10px;box-sizing:border-box;height:100vh;display:flex;flex-direction:column;overflow:auto}
       #board-root:fullscreen .stage{flex:1;min-height:0}
@@ -1151,7 +1265,8 @@
       #board-root canvas.panning{cursor:grabbing}
       #board-root .wrap.bgadjust{border-color:#0b6bcb;box-shadow:0 0 0 2px rgba(11,107,203,.25)}
       #board-root .wrap.dropping{outline:3px dashed #0b6bcb;outline-offset:-6px}
-      #board-root .sel{display:flex;gap:8px;align-items:center;flex-wrap:wrap;padding:8px 12px;margin:8px 0;background:#fff;border:1px solid #d5d9df;border-radius:10px}
+      #board-root .sel{display:flex;gap:10px;align-items:stretch;flex-wrap:wrap;margin:10px 0}
+      #board-root .sel.hidden{display:none}
       #board-root .sel input[type=color]{width:38px;height:30px;padding:0;border:1px solid #bbb;border-radius:6px;background:none}
       #board-root .sel .nm{font-weight:600;margin-right:6px}
       #board-modal{position:fixed;inset:0;z-index:9999;background:rgba(15,18,24,.78);display:flex;flex-direction:column}
@@ -1162,21 +1277,34 @@
       #board-modal img{position:absolute;left:0;top:0;max-width:none;max-height:none;transform-origin:0 0;background:#fff;box-shadow:0 4px 24px rgba(0,0,0,.4);user-select:none;-webkit-user-drag:none;will-change:transform}`;
     document.head.appendChild(style);
 
-    const bar = el('div', 'bar');
-    const mk = (t, f, cls) => { const b = el('button', cls || 'secondary', t); b.type = 'button'; b.addEventListener('click', f); bar.appendChild(b); return b; };
-    mk('Fit all', fit);
-    mk('Zoom +', () => zoomAt(W / 2, H / 2, 1.3));
-    mk('Zoom −', () => zoomAt(W / 2, H / 2, 1 / 1.3));
-    undoBtn = mk('↶ Undo', undo); undoBtn.title = 'Undo (Ctrl/Cmd+Z)';
-    redoBtn = mk('↷ Redo', redo); redoBtn.title = 'Redo (Ctrl/Cmd+Shift+Z or Ctrl+Y)';
-    lockBtn = mk('🔓 Unlocked', toggleLock);
+    const bar = el('div', 'bar'); let grp = bar;
+    const group = (title) => { grp = el('div', 'grp'); grp.appendChild(el('span', 'gt', title)); bar.appendChild(grp); return grp; };
+    const mk = (t, f, cls, tip) => { const b = el('button', cls || 'secondary', t); b.type = 'button'; if (tip) b.title = tip; b.addEventListener('click', f); grp.appendChild(b); return b; };
+
+    group('View');
+    mk('Fit all', fit, 'secondary', 'Zoom out so every piece is visible');
+    mk('＋', () => zoomAt(W / 2, H / 2, 1.3), 'secondary', 'Zoom in (or use the mouse wheel)');
+    mk('－', () => zoomAt(W / 2, H / 2, 1 / 1.3), 'secondary', 'Zoom out');
+    const fsBtn = mk('⛶ Full screen', () => { if (document.fullscreenElement) document.exitFullscreen(); else root.requestFullscreen && root.requestFullscreen(); });
+    document.addEventListener('fullscreenchange', () => {          // the button turns into "Exit full screen" while full screen is on (Esc works too)
+      const on = document.fullscreenElement === root;
+      fsBtn.textContent = on ? '⤡ Exit full screen' : '⛶ Full screen';
+      fsBtn.title = on ? 'Leave full screen (Esc)' : 'Show the whole board, toolbar and tray full screen';
+    });
+
+    group('Edit');
+    undoBtn = mk('↶ Undo', undo, 'secondary', 'Undo (Ctrl/Cmd+Z)');
+    redoBtn = mk('↷ Redo', redo, 'secondary', 'Redo (Ctrl/Cmd+Shift+Z or Ctrl+Y)');
+    lockBtn = mk('🔓 Lock board', toggleLock, 'secondary lock');
     updateHist();
     const sl = el('label'); snapBox = el('input'); snapBox.type = 'checkbox'; snapBox.checked = true;
-    sl.append(snapBox, document.createTextNode('Snap edges (hold Alt to drag freely)')); bar.appendChild(sl);
+    sl.append(snapBox, document.createTextNode('Snap edges')); sl.title = 'Pieces stick edge to edge when dragged close. Hold Alt while dragging to move freely.'; grp.appendChild(sl);
     const ll = el('label'); linesBox = el('input'); linesBox.type = 'checkbox'; linesBox.checked = false;
     linesBox.addEventListener('change', schedule);
-    ll.append(linesBox, document.createTextNode('Show inner lines')); bar.appendChild(ll);
-    autoBtn = mk('Auto-arrange pieces', async () => {
+    ll.append(linesBox, document.createTextNode('Inner lines')); ll.title = 'Also draw the lines inside each sheet (plot boundaries), not just its outer outline'; grp.appendChild(ll);
+
+    group('Arrange');
+    autoBtn = mk('✨ Auto-arrange', async () => {
       if (boardLocked) { lockedMsg(); return; }
       const before = snapshot();
       setStatus('Arranging the pieces automatically…');
@@ -1196,39 +1324,54 @@
         await refineAll(); pieces.forEach(p => dirty.add(p.id));
         flushSave(); fit(); schedule(); setStatus(`Pieces auto-arranged (${d.joined} joined group(s)). Drag pieces to correct anything.`, 'good');
       } catch (e) { setStatus(e.message, 'error'); }
-    });
-    mk('New colours', () => {
+    }, 'secondary b-pri');
+    autoBtn.title = 'Place all pieces automatically from the survey numbers, then fine-tune the edges';
+    mk('Collect loose → tray', collectLoose, 'secondary', 'Send every piece that touches no other piece back to the tray on the left');
+    mk('🎨 New colours', () => {
       pushUndo(); const off = Math.random();
       pieces.concat(tray).forEach((p, i) => { p.color = hsv((off + i * 0.61803398875) % 1, i % 2 ? 0.78 : 0.62, i % 3 ? 0.92 : 0.8); dirty.add(p.id); });
       flushSave(); updateSel(); renderTray(); schedule();
-    });
+    }, 'secondary');
+    group('Danger');
     mk('Reset layout', async () => {
       if (boardLocked) { lockedMsg(); return; }
       if (!window.confirm('Take every piece off the board and put it back in the tray? Your manual placement will be lost.')) return;
       const before = snapshot(); await fetch('/api/board/reset', { method: 'POST' }); await load(false); pushUndo(before);
-    });
-    mk('Collect loose pieces → tray', collectLoose).title = 'Send every piece that touches no other piece back to the tray on the left';
-    const fsBtn = mk('Full screen', () => { if (document.fullscreenElement) document.exitFullscreen(); else root.requestFullscreen && root.requestFullscreen(); });
-    document.addEventListener('fullscreenchange', () => {          // the button turns into "Minimise screen" while full screen is on (Esc works too)
-      const on = document.fullscreenElement === root;
-      fsBtn.textContent = on ? '⤡ Minimise screen' : 'Full screen';
-      fsBtn.title = on ? 'Leave full screen (Esc)' : 'Show the whole board, toolbar and tray full screen';
-    });
-    fmtSel = el('select'); fmtSel.title = 'File type for the download';
-    [['png', 'PNG'], ['pdf', 'PDF'], ['tif', 'TIF']].forEach(([v, t]) => { const o = el('option', '', t); o.value = v; fmtSel.appendChild(o); });
-    mk('Download puzzle', () => exportPuzzle(fmtSel.value)).title = 'Save the coloured puzzle (no background image) as PNG, PDF or TIF. Inner lines are included only if "Show inner lines" is ticked';
-    bar.appendChild(fmtSel);
+    }, 'secondary b-danger');
+
+    group('Background');
     bgInput = el('input'); bgInput.type = 'file'; bgInput.accept = 'image/*,.tif,.tiff'; bgInput.style.display = 'none';
     bgInput.addEventListener('change', () => { bgUpload(bgInput.files[0]); bgInput.value = ''; });
-    bar.appendChild(bgInput);
-    bgBtn = mk('Background image…', () => bgInput.click()); bgBtn.title = 'Upload an image or TIFF (or drop / paste one on the board) to sit behind the pieces';
-    bgAdjBtn = mk('Move background', () => { if (!bg) return; bgAdjust = !bgAdjust; if (bgAdjust) select(null); updateBgUI(); schedule(); setStatus(bgAdjust ? 'Moving the background: drag to move, wheel to resize, Shift+wheel to rotate. Press Done when it lines up.' : 'Background fixed. Pieces can be moved again.'); });
-    const ol = el('label'); ol.append(document.createTextNode('Background'));
-    bgOpacity = el('input'); bgOpacity.type = 'range'; bgOpacity.min = '5'; bgOpacity.max = '100'; bgOpacity.value = '60'; bgOpacity.style.width = '110px';
+    grp.appendChild(bgInput);
+    bgBtn = mk('🖼 Upload image…', () => bgInput.click(), 'secondary', 'Upload an image or TIFF (or drop / paste one on the board) to sit behind the pieces');
+    bgAdjBtn = mk('✥ Move background', () => { if (!bg) return; bgAdjust = !bgAdjust; if (bgAdjust) select(null); updateBgUI(); schedule(); setStatus(bgAdjust ? 'Moving the background: drag to move, wheel to resize, Shift+wheel to rotate. Press Done when it lines up.' : 'Background fixed. Pieces can be moved again.'); });
+    bgAdjBtn.title = 'Drag = move, mouse wheel = resize, Shift+wheel = rotate';
+    bgScaleBtn = mk('📏 Set scale…', () => pinStart('scale'), 'secondary', 'Click two points on the background and enter their real distance in metres (use the scale bar)');
+    const ol = el('label'); ol.append(document.createTextNode('Opacity'));
+    bgOpacity = el('input'); bgOpacity.type = 'range'; bgOpacity.min = '5'; bgOpacity.max = '100'; bgOpacity.value = '60'; bgOpacity.style.width = '90px';
     bgOpacity.addEventListener('input', () => { if (bg) { bg.opacity = bgOpacity.value / 100; schedule(); bgSaveSoon(); } });
-    ol.appendChild(bgOpacity); bar.appendChild(ol);
-    bgClearBtn = mk('Remove background', bgClear);
-    bgScaleBtn = mk('Set bg scale…', () => pinStart('scale')); bgScaleBtn.title = 'Click two points on the background and enter their real distance in metres (use the scale bar)';
+    ol.appendChild(bgOpacity); grp.appendChild(ol);
+    bgClearBtn = mk('Remove', bgClear, 'secondary b-danger', 'Remove the background image');
+
+    group('Check against background');
+    fitBtn2 = mk('◎ Check fit', () => {
+      if (!bg) { setStatus('Upload a background image first.', 'error'); return; }
+      fitOn = !fitOn; fitBtn2.textContent = fitOn ? '■ Stop checking' : '◎ Check fit'; fitBtn2.classList.toggle('on', fitOn);
+      if (fitOn) fitReport();
+      fitAnimate(fitOn);
+      schedule();
+    }, 'secondary', 'Blink red on every stretch of a piece outline that does not sit on a line of the background, and flag pieces that do not match it');
+    const fl = el('label'); fl.append(document.createTextNode('Tolerance'));
+    fitSel = el('select'); fitSel.title = 'How close to a background line an outline must be to count as matching';
+    [['4', 'Strict'], ['8', 'Normal'], ['16', 'Loose']].forEach(([v, t]) => { const o = el('option', '', t); o.value = v; if (v === '8') o.selected = true; fitSel.appendChild(o); });
+    fitSel.addEventListener('change', () => { fitTolPx = +fitSel.value; if (fitOn) fitReport(); schedule(); });
+    fl.appendChild(fitSel); grp.appendChild(fl);
+
+    group('Export');
+    fmtSel = el('select'); fmtSel.title = 'File type for the download';
+    [['png', 'PNG'], ['pdf', 'PDF'], ['tif', 'TIF']].forEach(([v, t]) => { const o = el('option', '', t); o.value = v; fmtSel.appendChild(o); });
+    grp.appendChild(fmtSel);
+    mk('⬇ Download puzzle', () => exportPuzzle(fmtSel.value), 'secondary', 'Save the coloured puzzle (no background image) as PNG, PDF or TIF. Inner lines are included only if "Inner lines" is ticked');
     root.appendChild(bar);
     statusEl = el('div', 'status'); statusEl.setAttribute('role', 'status'); root.appendChild(statusEl);
 
@@ -1238,25 +1381,30 @@
     selColor.addEventListener('change', () => { colorPending = false; });
     const rb = (t, d, title) => { const b = el('button', 'secondary', t); b.type = 'button'; b.title = title; b.addEventListener('click', () => rotateSel(d)); return b; };
     const fitBtn = el('button', 'secondary', 'Auto-fit piece'); fitBtn.type = 'button'; fitBtn.title = 'Rotate and slide this piece so its edges sit flush on its neighbours (key F)'; fitBtn.addEventListener('click', () => fitWithUndo(selected));
-    const open = el('button', 'secondary', 'Open clean image'); open.type = 'button'; open.addEventListener('click', () => selected && openViewer(selected));
+    const open = el('button', 'secondary', '🔍 Open clean image'); open.type = 'button'; open.title = 'View the cleaned sheet of this piece'; open.addEventListener('click', () => selected && openViewer(selected));
     const szWrap = el('label'); szWrap.style.cssText = 'display:flex;gap:6px;align-items:center;font-size:14px';
     selSize = el('input'); selSize.type = 'number'; selSize.min = '0.02'; selSize.max = '5'; selSize.step = '0.01'; selSize.style.width = '80px';
     selSize.title = 'Size of this piece: 1 = as read from the sheet scale. Keys [ and ] change it by 2%.';
     selSize.addEventListener('change', () => { const f = parseFloat(selSize.value); if (selected && isFinite(f) && f > 0) sizeSel(f); else updateSel(); });
-    szWrap.append(document.createTextNode('Size ×'), selSize);
+    szWrap.append(document.createTextNode('×'), selSize);
     const szReset = el('button', 'secondary', 'Reset size'); szReset.type = 'button'; szReset.title = 'Back to the size read from the sheet';
     szReset.addEventListener('click', () => sizeSel(1));
-    pieceLockBtn = el('button', 'secondary', '🔓 Lock piece'); pieceLockBtn.type = 'button'; pieceLockBtn.title = 'Lock just this piece so it cannot be moved by accident (key K)'; pieceLockBtn.addEventListener('click', () => togglePieceLock(selected));
+    pieceLockBtn = el('button', 'secondary lock', '🔓 Lock piece'); pieceLockBtn.type = 'button'; pieceLockBtn.title = 'Lock just this piece so it cannot be moved by accident (key K)'; pieceLockBtn.addEventListener('click', () => togglePieceLock(selected));
     const nudgeBox = el('span'); nudgeBox.style.cssText = 'display:inline-flex;gap:4px;align-items:center';
-    nudgeBox.append(document.createTextNode('Move'), mkNudge('◀', -1, 0, 'Move left (←). Click-and-hold repeats, Shift = bigger steps'), mkNudge('▲', 0, -1, 'Move up (↑)'), mkNudge('▼', 0, 1, 'Move down (↓)'), mkNudge('▶', 1, 0, 'Move right (→)'));
-    const toTray = el('button', 'secondary', 'Send to tray'); toTray.type = 'button'; toTray.title = 'Take this piece off the board and put it back in the tray (key T)'; toTray.addEventListener('click', () => sendToTray(selected));
+    nudgeBox.append(mkNudge('◀', -1, 0, 'Move left (←). Click-and-hold repeats, Shift = bigger steps'), mkNudge('▲', 0, -1, 'Move up (↑)'), mkNudge('▼', 0, 1, 'Move down (↓)'), mkNudge('▶', 1, 0, 'Move right (→)'));
+    const toTray = el('button', 'secondary', '↩ Send to tray'); toTray.type = 'button'; toTray.title = 'Take this piece off the board and put it back in the tray (key T)'; toTray.addEventListener('click', () => sendToTray(selected));
     const szNb = el('button', 'secondary', 'Auto-size to neighbours'); szNb.type = 'button'; szNb.title = 'Try other sizes for this piece and keep the one where its outline and corners meet the pieces next to it';
     szNb.addEventListener('click', () => sizeOne(selected));
     const szCh = el('button', 'secondary', 'Auto-size chain from here'); szCh.type = 'button'; szCh.title = 'Treat this piece as correct, then fit the pieces touching it, then the ones touching those, and so on';
     szCh.addEventListener('click', () => sizeChain(selected));
     pinBtn = el('button', 'secondary', 'Pin-fit to background'); pinBtn.type = 'button'; pinBtn.title = 'Click the same two spots on this piece and on the background: the piece is moved, turned and resized to match';
     pinBtn.addEventListener('click', () => pinStart('fit'));
-    selBar.append(selName, selColor, pieceLockBtn, nudgeBox, szWrap, szReset, toTray, szNb, szCh, pinBtn, rb('⟲ 90°', -90, 'Shift+Q'), rb('⟲ 1°', -1, 'Q'), rb('⟳ 1°', 1, 'E'), rb('⟳ 90°', 90, 'Shift+E'), fitBtn, open);
+    const sg = (title) => { const g = el('div', 'grp'); g.appendChild(el('span', 'gt', title)); selBar.appendChild(g); return g; };
+    sg('Selected piece').append(selName, selColor, pieceLockBtn, toTray, open);
+    sg('Move').append(nudgeBox);
+    sg('Rotate').append(rb('↺ 90°', -90, 'Rotate left 90° (Shift+Q)'), rb('↺ 1°', -1, 'Rotate left 1° (Q)'), rb('↻ 1°', 1, 'Rotate right 1° (E)'), rb('↻ 90°', 90, 'Rotate right 90° (Shift+E)'));
+    sg('Size').append(szWrap, szReset);
+    sg('Fit this piece').append(fitBtn, szNb, szCh, pinBtn);
     root.appendChild(selBar);
 
     wrap = el('div', 'wrap'); canvas = el('canvas'); wrap.appendChild(canvas);
