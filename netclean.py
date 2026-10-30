@@ -775,7 +775,91 @@ def clean_network(net, s, log=print, dash_pts=None, chains=None, txt=None):
     out = reconstruct(net0, sk3, dt)
     # thick outer-boundary strokes are never touched
     out = out | thickm
+    out = restore_cut_edges(out, net0, s, log)
     return bridge_gaps(out, s, log, txt=txt)
+
+
+def restore_cut_edges(mask, ink, s, log=print, max_gap=110, min_branch=60):
+    """A boundary that a dash-dot construction line crossed can lose a short stretch (the stretch is cleaned away together
+    with the dash). Put it back when the ORIGINAL ink is still there and
+      (a) a kept straight line stops, and carried straight on through original ink it runs into other kept ink, or
+      (b) two kept ends at a corner meet when both are carried on through original ink.
+    Nothing is invented: every restored pixel was black ink on the sheet."""
+    H, W = mask.shape
+    sk = skeletonize(mask)
+    deg = _deg(sk)
+    ends = np.argwhere(_endmask(sk, deg))
+    if len(ends) == 0: return mask
+    inkd = cv2.dilate(ink.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0
+    maskd = cv2.dilate(mask.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    dt = cv2.distanceTransform(mask.astype(np.uint8), cv2.DIST_L2, 3)
+    R = int(90*s) + 5
+    info = []
+    for (ey, ex) in ends:
+        y0, y1, x0, x1 = max(ey-R, 0), min(ey+R+1, H), max(ex-R, 0), min(ex+R+1, W)
+        crop = sk[y0:y1, x0:x1].astype(np.uint8)
+        nl, ll = cv2.connectedComponents(crop, connectivity=8)
+        l = ll[ey-y0, ex-x0]
+        if l == 0: continue
+        ys, xs = np.nonzero(ll == l)
+        P = np.stack([xs + x0, ys + y0], 1).astype(np.float64)
+        dd = np.hypot(P[:, 0]-ex, P[:, 1]-ey)
+        q = P[(dd >= 14*s) & (dd <= 80*s)]                       # skip the very tip: a hook / dash stub left there is not the line
+        if len(q) < 0.5*(66*s) or (dd.max() < min_branch*s): continue
+        cq = q.mean(0); sv, vt = np.linalg.svd(q - cq, full_matrices=False)[1:]
+        if sv[1] > 0.10*sv[0]: continue                             # must be a straight stretch
+        u = vt[0]
+        if (np.array([ex, ey], np.float64) - cq) @ u < 0: u = -u
+        info.append((np.array([ex, ey], np.float64), u, float(dt[ey, ex])))
+    out = np.zeros(mask.shape, np.uint8)
+    gmin = max(3, int(6*s/2)); nmax = int(max_gap*s/2)
+    def ink_run(p, q):
+        L = float(np.hypot(*(q - p)))
+        if L < 1: return 1.0
+        n = max(3, int(L/2)); ok = 0
+        for t in np.linspace(0, 1, n):
+            x, y = p + (q - p)*t; x = int(round(x)); y = int(round(y))
+            ok += bool(0 <= y < H and 0 <= x < W and (inkd[y, x] or maskd[y, x]))
+        return ok / n
+    drawn = 0; used = set()
+    # (a) straight on into other kept ink
+    for k, (e, u, w_) in enumerate(info):
+        gap = 0; start = None
+        for i_ in range(1, nmax + 1):
+            q = e + u*2*i_; qx, qy = int(round(q[0])), int(round(q[1]))
+            if not (0 <= qy < H and 0 <= qx < W): break
+            if maskd[qy, qx]:
+                if gap >= gmin and start is not None:
+                    if ink_run(e, q) >= 0.92:
+                        cv2.line(out, (int(round(e[0])), int(round(e[1]))), (qx, qy), 1, max(3, int(round(2*w_)) + 1))
+                        used.add(k); drawn += 1
+                    break
+                if gap == 0: continue
+                gap = 0
+            else:
+                gap += 1; start = start or i_
+                if not inkd[qy, qx] and gap > 3: break                  # the sheet has no ink here: nothing was cut
+    # (b) corners
+    Dmax = max_gap*s*1.2
+    for a_ in range(len(info)):
+        if a_ in used: continue
+        for b_ in range(a_ + 1, len(info)):
+            if b_ in used: continue
+            e1, u1, w1 = info[a_]; e2, u2, w2 = info[b_]
+            if np.hypot(*(e1 - e2)) > 2.5*Dmax: continue
+            if abs(u1 @ u2) >= 0.45: continue
+            A = np.array([[u1[0], -u2[0]], [u1[1], -u2[1]]])
+            try: t1, t2 = np.linalg.solve(A, e2 - e1)
+            except np.linalg.LinAlgError: continue
+            if not (0 < t1 < Dmax and 0 < t2 < Dmax) or max(t1, t2) < 8*s: continue
+            Pc = e1 + u1*t1
+            if ink_run(e1, Pc) < 0.92 or ink_run(e2, Pc) < 0.92: continue
+            cv2.line(out, tuple(int(round(v)) for v in e1), tuple(int(round(v)) for v in Pc), 1, max(3, int(round(2*w1)) + 1))
+            cv2.line(out, tuple(int(round(v)) for v in e2), tuple(int(round(v)) for v in Pc), 1, max(3, int(round(2*w2)) + 1))
+            used.add(a_); used.add(b_); drawn += 1
+            break
+    log(f'  restored {drawn} cut boundary stretches from the original ink')
+    return mask | (out > 0)
 
 
 def _gap_in_text(txt, y, x, d, s):

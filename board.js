@@ -538,6 +538,11 @@
     for (const p of list) {
       const it = el('div', 'it'); it.draggable = true; it.title = 'Drag onto the board, or double-click to drop it in the middle';
       it.appendChild(thumb(p)); it.appendChild(el('span', '', 'S.' + p.survey));
+      const del = el('button', 'del', '🗑'); del.type = 'button'; del.title = 'Delete this sheet permanently (dustbin)';
+      del.draggable = false;
+      del.addEventListener('click', ev => { ev.stopPropagation(); deleteFromTray(p); });
+      del.addEventListener('dblclick', ev => ev.stopPropagation());
+      it.appendChild(del);
       it.addEventListener('dragstart', ev => { ev.dataTransfer.setData('application/x-plotpiece', p.id); ev.dataTransfer.setData('text/plain', p.id); ev.dataTransfer.effectAllowed = 'move'; });
       it.addEventListener('dblclick', () => placeFromTray(p, W / 2, H / 2));
       trayList.appendChild(it);
@@ -760,45 +765,78 @@
     const g = cv.getContext('2d');
     g.fillStyle = '#fff'; g.fillRect(0, 0, cw, ch);
     const ox = pad - x0 * k, oy = pad - y0 * k;
-    for (const p of pieces) {
-      g.save();
-      g.translate(ox + p.x * k, oy + p.y * k); g.rotate(p.rot * Math.PI / 180);
-      const sc = p.mpp * k; g.scale(sc, sc);
-      const path = () => { g.beginPath(); p.poly.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y)); g.closePath(); };
-      path(); g.fillStyle = '#fff'; g.fill();
-      g.globalAlpha = 0.42; g.fillStyle = p.color; g.fill(); g.globalAlpha = 1;
-      if (withLines && p.loaded) {                                // keep the sheet's own lines inside the piece, so stray ink never pokes out past the boundary
-        g.save(); path(); g.clip(); g.drawImage(p.img, 0, 0, p.w, p.h); g.restore();
+    // Gaps / overlaps between sheets narrower than TOL px count as "touching": only ONE boundary line is drawn there.
+    // Make TOL bigger if you still see two lines where sheets nearly touch.
+    const bwid = Math.max(2, Math.round(Math.max(cw, ch) / 1600));          // line thickness in px, grows with image size
+    const TOL = Math.max(6, Math.round(Math.max(cw, ch) / 250));
+    const LINE_W = Math.max(3, bwid * 1.2);                                   // thickness of the line between sheets, px (raise for bolder lines)
+    const place = (c, p, dx, dy) => {                                         // piece space -> canvas c (shifted by dx,dy); returns scale
+      const sc = p.mpp * k;
+      c.translate(ox + p.x * k - dx, oy + p.y * k - dy); c.rotate(p.rot * Math.PI / 180); c.scale(sc, sc);
+      return sc;
+    };
+    const polyPath = (c, p) => { c.beginPath(); p.poly.forEach(([x, y], i) => i ? c.lineTo(x, y) : c.moveTo(x, y)); c.closePath(); };
+    // bounding box of every piece on the canvas (+ margin), so the work below happens on small temporary canvases
+    const margin = TOL + bwid + 3;
+    const boxes = pieces.map(p => {
+      const a = p.rot * Math.PI / 180, c = Math.cos(a), sn = Math.sin(a), sc = p.mpp * k;
+      let X0 = 1e18, Y0 = 1e18, X1 = -1e18, Y1 = -1e18;
+      for (const [x, y] of p.poly) {
+        const wx = ox + p.x * k + sc * (c * x - sn * y), wy = oy + p.y * k + sc * (sn * x + c * y);
+        X0 = Math.min(X0, wx); Y0 = Math.min(Y0, wy); X1 = Math.max(X1, wx); Y1 = Math.max(Y1, wy);
       }
-      g.lineJoin = 'round'; g.lineWidth = 1.6 * Math.max(1, k / 40) / sc * 1; g.strokeStyle = p.color; path(); g.stroke();
-      g.restore();
-    }
-    // ---- boundaries: a dark line on every piece edge (including where pieces touch), plus a thicker outer line around the whole puzzle.
-    {
-      const bwid = Math.max(2, Math.round(Math.max(cw, ch) / 1600));          // line thickness in px, grows with image size
-      // edges between touching pieces (and every piece's own edge): a thinner dark line, drawn centred on the edge
-      for (const p of pieces) {
-        g.save(); g.translate(ox + p.x * k, oy + p.y * k); g.rotate(p.rot * Math.PI / 180);
-        const sc = p.mpp * k; g.scale(sc, sc);
-        g.beginPath(); p.poly.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y)); g.closePath();
-        g.lineJoin = 'round'; g.lineWidth = Math.max(1.5, bwid * 0.5) / sc; g.strokeStyle = '#111'; g.stroke();
-        g.restore();
+      const bx = Math.floor(X0 - margin), by = Math.floor(Y0 - margin);
+      return { x: bx, y: by, w: Math.ceil(X1 + margin) - bx, h: Math.ceil(Y1 + margin) - by };
+    });
+    const hit = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+    // erase from temp canvas `t` (belonging to piece i) everything within TOL of piece j (inside it, or just outside it)
+    const eraseNear = (t, bi, j) => {
+      t.save(); t.globalCompositeOperation = 'destination-out';
+      const sc = place(t, pieces[j], bi.x, bi.y); polyPath(t, pieces[j]);
+      t.fill(); t.lineJoin = 'round'; t.lineWidth = 2 * TOL / sc; t.stroke();
+      t.restore();
+    };
+    // grow piece i by TOL (fill + a stroke of 2*TOL) as a path on canvas c
+    const growFill = (c, p, bi) => {
+      c.save(); const sc = place(c, p, bi.x, bi.y); polyPath(c, p);
+      c.fill(); c.lineJoin = 'round'; c.lineWidth = 2 * TOL / sc; c.stroke(); c.restore();
+    };
+    // Every sheet is "grown" by GROW px before it is painted, so sheets that are less than TOL px apart overlap and
+    // are joined: the colour is continuous and the edge lines meet. Later sheets lie on top of earlier ones.
+    const GROW = TOL / 2;
+    const growPath = (c, p, bi, amt) => {                                     // piece grown by amt px, as fill + stroke on c
+      c.save(); const sc = place(c, p, bi.x, bi.y); polyPath(c, p);
+      c.fill(); if (amt > 0) { c.lineJoin = 'round'; c.lineWidth = 2 * amt / sc; c.stroke(); } c.restore();
+    };
+    pieces.forEach((p, i) => {
+      const rgb = [1, 3, 5].map(o => parseInt(p.color.slice(o, o + 2), 16) || 0);       // white + 42% tint, but opaque
+      g.fillStyle = g.strokeStyle = 'rgb(' + rgb.map(v => Math.round(255 * 0.58 + v * 0.42)).join(',') + ')';
+      growPath(g, p, { x: 0, y: 0 }, GROW);
+      if (withLines && p.loaded) {                                            // the sheet's own lines, clipped to the piece
+        const b = boxes[i];
+        const t = document.createElement('canvas'); t.width = b.w; t.height = b.h; const tg = t.getContext('2d');
+        tg.save(); place(tg, p, b.x, b.y); polyPath(tg, p); tg.clip(); tg.drawImage(p.img, 0, 0, p.w, p.h); tg.restore();
+        // the sheet's printed border must not become a 2nd line beside the neighbour that lies on top of it
+        for (let j = i + 1; j < pieces.length; j++) if (hit(b, boxes[j])) eraseNear(tg, b, j);
+        g.drawImage(t, b.x, b.y);
       }
-      const m = document.createElement('canvas'); m.width = cw; m.height = ch;
-      const mg = m.getContext('2d');
-      const each = fn => {
-        for (const p of pieces) {
-          mg.save(); mg.translate(ox + p.x * k, oy + p.y * k); mg.rotate(p.rot * Math.PI / 180);
-          const sc = p.mpp * k; mg.scale(sc, sc);
-          mg.beginPath(); p.poly.forEach(([x, y], i) => i ? mg.lineTo(x, y) : mg.moveTo(x, y)); mg.closePath();
-          fn(sc); mg.restore();
-        }
-      };
-      mg.fillStyle = mg.strokeStyle = '#111'; mg.lineJoin = 'round';
-      each(sc => { mg.lineWidth = 2 * bwid / sc; mg.stroke(); mg.fill(); });  // pieces grown by bwid
-      mg.globalCompositeOperation = 'destination-out';
-      each(() => mg.fill());                                                   // minus the pieces themselves -> ring outside the union
-      g.drawImage(m, 0, 0);
+    });
+    // ---- boundaries: one dark line along the (grown) edge of every sheet, except where a later sheet covers it.
+    // Because neighbours overlap after growing, their lines meet and there are no loose ends.
+    const half = LINE_W / 2, inner = Math.max(0, GROW - half);
+    pieces.forEach((p, i) => {
+      const b = boxes[i];
+      const t = document.createElement('canvas'); t.width = b.w; t.height = b.h; const tg = t.getContext('2d');
+      tg.fillStyle = tg.strokeStyle = '#111'; growPath(tg, p, b, GROW + half);          // ring of width LINE_W on the grown edge
+      tg.globalCompositeOperation = 'destination-out'; growPath(tg, p, b, inner);
+      for (let j = i + 1; j < pieces.length; j++) if (hit(b, boxes[j])) growPath(tg, pieces[j], b, GROW);   // hidden under a later sheet
+      g.drawImage(t, b.x, b.y);
+    });
+    {   // thicker outer line around the outside of the whole puzzle
+      const o = document.createElement('canvas'); o.width = cw; o.height = ch; const og = o.getContext('2d');
+      og.fillStyle = og.strokeStyle = '#111'; for (const p of pieces) growPath(og, p, { x: 0, y: 0 }, GROW + bwid);
+      og.globalCompositeOperation = 'destination-out'; for (const p of pieces) growPath(og, p, { x: 0, y: 0 }, GROW);
+      g.drawImage(o, 0, 0);
     }
     for (const p of pieces) {
       const a = p.rot * Math.PI / 180, c = Math.cos(a), s = Math.sin(a);
@@ -854,13 +892,116 @@
     p.ctr = visualCentre(p.poly);
     refresh(p); return p;
   }
+  // ------------------------------------------------------------------ import files / save + load layout
+  function exportLayout() {
+    const all = pieces.concat(tray);
+    if (!all.length) { setStatus('Nothing on the board to save yet.', 'error'); return; }
+    const r1 = v => Math.round(v * 1000) / 1000;
+    const data = { app: 'plot-map-cleaner-board', version: 1, pieces: all.map(p => ({ id: p.id, survey: p.survey, name: p.name,
+      x: r1(p.x), y: r1(p.y), rot: r1(p.rot), sz: p.sz, color: p.color, placed: p.placed !== false, locked: !!p.locked })) };
+    const a = document.createElement('a'); a.href = URL.createObjectURL(new Blob([JSON.stringify(data, null, 1)], { type: 'application/json' }));
+    a.download = 'board_layout.json'; document.body.appendChild(a); a.click(); a.remove(); setTimeout(() => URL.revokeObjectURL(a.href), 5000);
+    setStatus(`Saved board_layout.json (${all.length} piece(s)).`, 'good');
+  }
+  async function importLayout(file) {
+    if (boardLocked) { lockedMsg(); return; }
+    let data;
+    try { data = JSON.parse(await file.text()); } catch (e) { setStatus('That is not a valid layout file.', 'error'); return; }
+    const list = Array.isArray(data) ? data : (data && data.pieces);
+    if (!Array.isArray(list)) { setStatus('That file has no pieces in it.', 'error'); return; }
+    const all = pieces.concat(tray);
+    const bySurvey = new Map(), byName = new Map();
+    for (const p of all) {                                         // survey / file name only count when they are unique
+      bySurvey.set(String(p.survey), bySurvey.has(String(p.survey)) ? null : p);
+      byName.set(String(p.name), byName.has(String(p.name)) ? null : p);
+    }
+    const body = {}; let n = 0, miss = 0;
+    for (const e of list) {
+      const p = all.find(q => q.id === e.id) || bySurvey.get(String(e.survey)) || byName.get(String(e.name));
+      if (!p || !isFinite(+e.x) || !isFinite(+e.y)) { miss++; continue; }
+      body[p.id] = { x: +e.x, y: +e.y, rot: +e.rot || 0, placed: e.placed !== false, locked: !!e.locked };
+      if (isFinite(+e.sz) && +e.sz > 0) body[p.id].sz = +e.sz;
+      if (typeof e.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(e.color)) body[p.id].color = e.color;
+      n++;
+    }
+    if (!n) { setStatus('None of the pieces in that file match the sheets on this board.', 'error'); return; }
+    const before = snapshot();
+    setStatus('Applying the layout…');
+    try {
+      const r = await fetch('/api/board/layout', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pieces: body }) });
+      if (!r.ok) throw new Error((await r.json()).error || 'Could not apply the layout.');
+      await load(true); pushUndo(before);
+      setStatus(`Layout applied to ${n} piece(s)` + (miss ? `; ${miss} piece(s) in the file have no matching sheet here.` : '.'), 'good');
+    } catch (e) { setStatus(e.message, 'error'); }
+  }
+  // progress bar under the status line: frac 0..1 = filled bar, null = "working, unknown length" (moving stripes)
+  let progEl, progBar;
+  function progShow(frac, label) {
+    if (!progEl) return;
+    progEl.classList.remove('hidden');
+    progEl.classList.toggle('ind', frac == null);
+    progBar.style.width = frac == null ? '100%' : Math.max(2, Math.min(100, Math.round(frac * 100))) + '%';
+    if (label) setStatus(label);
+  }
+  function progHide() { if (progEl) progEl.classList.add('hidden'); }
+  function postImport(fd, onUpload) {
+    return new Promise((resolve, reject) => {
+      const x = new XMLHttpRequest(); x.open('POST', '/api/board/import');
+      x.upload.onprogress = e => { if (e.lengthComputable) onUpload(e.loaded / e.total); };
+      x.upload.onload = () => onUpload(1);
+      x.onload = () => {
+        let d = {}; try { d = JSON.parse(x.responseText); } catch (e) { /* not json */ }
+        if (x.status >= 200 && x.status < 300) resolve(d); else reject(new Error(d.error || 'Import failed.'));
+      };
+      x.onerror = () => reject(new Error('Network error while importing.'));
+      x.send(fd);
+    });
+  }
+  async function deleteFromTray(p) {
+    if (!window.confirm(`Delete sheet S.${p.survey} (${p.name || 'file'}) permanently?\n\nIt will be removed from Approved Images and from the board. This cannot be undone.`)) return;
+    setStatus(`Deleting S.${p.survey}…`);
+    try {
+      const r = await fetch('/api/approved/' + encodeURIComponent(p.id), { method: 'DELETE' });
+      let d = {}; try { d = await r.json(); } catch (e) { /* ignore */ }
+      if (!r.ok) throw new Error(d.error || 'Could not delete the sheet.');
+      const i = tray.indexOf(p); if (i >= 0) tray.splice(i, 1);
+      renderTray(); schedule();
+      setStatus(`S.${p.survey} deleted.`, 'good');
+    } catch (e) { setStatus(e.message, 'error'); }
+  }
+  async function importFiles(files) {
+    const js = files.filter(f => /\.json$/i.test(f.name) || f.type === 'application/json');
+    const imgs = files.filter(f => !js.includes(f));
+    if (js.length) await importLayout(js[0]);
+    if (!imgs.length) return;
+    const fd = new FormData();
+    imgs.forEach(f => fd.append('files', f, f.name));
+    if (imgs.length === 1) {
+      const sv = window.prompt('Survey number for this sheet (leave empty to take it from the file name or the sheet itself):', '');
+      if (sv === null) return;
+      if (sv.trim()) fd.append('survey', sv.trim());
+    }
+    const label = `${imgs.length} file(s)`;
+    progShow(0, `Uploading ${label}… 0%`);
+    try {
+      const d = await postImport(fd, f => {
+        if (f < 1) progShow(f, `Uploading ${label}… ${Math.round(f * 100)}%`);
+        else progShow(null, `Processing ${label} on the server…`);
+      });
+      progShow(null, 'Adding the sheets to the board…');
+      await load(true);
+      const bad = Object.keys(d.errors || {});
+      setStatus(`Imported ${d.added.length} sheet(s) onto the board.` + (bad.length ? ` Could not read: ${bad.join(', ')}.` : ''), bad.length ? 'error' : 'good');
+    } catch (e) { setStatus(e.message, 'error'); }
+    progHide();
+  }
   async function load(keepView) {
     if (loading) return; loading = true;
     try {
       for (;;) {
         const r = await fetch('/api/board'); const d = await r.json();
         if (!r.ok) throw new Error(d.error || 'Could not load the board.');
-        if (d.state === 'preparing') { setStatus(`Preparing pieces… ${d.done || 0} of ${d.total || '?'}`); await new Promise(res => setTimeout(res, 1000)); continue; }
+        if (d.state === 'preparing') { progShow(d.total ? (d.done || 0) / d.total : null, `Preparing pieces… ${d.done || 0} of ${d.total || '?'}`); await new Promise(res => setTimeout(res, 1000)); continue; }
         const keepSel = selected && selected.id;
         const all = d.pieces.map(addPiece);
         pieces = all.filter(p => p.placed !== false); tray = all.filter(p => p.placed === false);
@@ -875,9 +1016,9 @@
         all.forEach(p => { if (p.sz_saved == null && Math.abs(p.sz - 1) > 1e-6) dirty.add(p.id); }); if (dirty.size) flushSave();
         if (all.some(p => !p.saved)) { all.forEach(p => dirty.add(p.id)); flushSave(); all.forEach(p => p.saved = true); }
         renderTray();
-        autoBtn.disabled = false; updateSel(); schedule(); if (!bg) bgLoad(); break;
+        autoBtn.disabled = false; updateSel(); schedule(); if (!bg) bgLoad(); progHide(); break;
       }
-    } catch (e) { setStatus(e.message, 'error'); }
+    } catch (e) { setStatus(e.message, 'error'); progHide(); }
     loading = false;
   }
   function flushSave() {
@@ -1257,6 +1398,13 @@
       #board-root .tray .it:hover{border-color:#0b6bcb}
       #board-root .tray .it canvas{width:64px;height:48px;flex:none}
       #board-root .tray .it span{font-weight:600;font-size:13px}
+      #board-root .tray .it .del{margin-left:auto;border:1px solid transparent;background:none;border-radius:6px;padding:4px 6px;font-size:15px;line-height:1;cursor:pointer;opacity:.55}
+      #board-root .tray .it .del:hover{opacity:1;background:#fdecea;border-color:#e6b8b8}
+      #board-root .prog{height:8px;margin:6px 0;background:#e3e6ea;border-radius:6px;overflow:hidden}
+      #board-root .prog.hidden{display:none}
+      #board-root .prog .bar{height:100%;width:0;background:#0b6bcb;border-radius:6px;transition:width .2s}
+      #board-root .prog.ind .bar{background:repeating-linear-gradient(45deg,#0b6bcb 0 12px,#5b9be0 12px 24px);background-size:34px 34px;animation:plotprog 0.8s linear infinite}
+      @keyframes plotprog{from{background-position:0 0}to{background-position:34px 0}}
       #board-root .tray .empty{font-size:13px;color:#667}
       #board-root .wrap{flex:1;min-width:0;position:relative;height:74vh;min-height:420px;background:#eceff3;border:1px solid #d5d9df;border-radius:10px;overflow:hidden}
       #board-root .wrap:fullscreen{height:100vh;border-radius:0}
@@ -1372,8 +1520,17 @@
     [['png', 'PNG'], ['pdf', 'PDF'], ['tif', 'TIF']].forEach(([v, t]) => { const o = el('option', '', t); o.value = v; fmtSel.appendChild(o); });
     grp.appendChild(fmtSel);
     mk('⬇ Download puzzle', () => exportPuzzle(fmtSel.value), 'secondary', 'Save the coloured puzzle (no background image) as PNG, PDF or TIF. Inner lines are included only if "Inner lines" is ticked');
+    mk('💾 Save layout', exportLayout, 'secondary', 'Save where every piece is (position, rotation, size, colour) as a .json file you can import again later');
+
+    group('Import');
+    const impInput = el('input'); impInput.type = 'file'; impInput.multiple = true; impInput.style.display = 'none';
+    impInput.accept = '.tif,.tiff,.png,.jpg,.jpeg,.bmp,.json,image/*,application/json';
+    impInput.addEventListener('change', () => { const fl = Array.from(impInput.files || []); impInput.value = ''; if (fl.length) importFiles(fl); });
+    root.appendChild(impInput);
+    mk('⬆ Import files…', () => impInput.click(), 'secondary', 'Add cleaned sheet images (TIF, PNG, JPG) straight onto the board as new pieces, or load a layout .json saved with "Save layout"');
     root.appendChild(bar);
     statusEl = el('div', 'status'); statusEl.setAttribute('role', 'status'); root.appendChild(statusEl);
+    progEl = el('div', 'prog hidden'); progBar = el('div', 'bar'); progEl.appendChild(progBar); root.appendChild(progEl);
 
     selBar = el('div', 'sel hidden'); selName = el('span', 'nm');
     selColor = el('input'); selColor.type = 'color'; selColor.title = 'Colour of this piece';

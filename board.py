@@ -709,6 +709,81 @@ def register(app, approved_records, approved_dir, puzzle_dir):
         except Exception as e:
             return jsonify(error=f'Could not convert: {e}'), 500
 
+    # ---------------------------------------------------------------- import sheet files straight onto the board
+    @app.route('/api/board/import', methods=['POST'])
+    def board_import():
+        """Add already-cleaned sheet images (TIF/PNG/JPG...) as approved sheets, so they become board pieces
+        without going through Upload -> Clean -> Review."""
+        import re
+        import uuid
+        from datetime import datetime
+        files = request.files.getlist('files')
+        if not files:
+            return jsonify(error='Choose one or more image files.'), 400
+        survey_in = (request.form.get('survey') or '').strip()[:20]
+        scale_in = None
+        if (request.form.get('scale') or '').strip():
+            try:
+                scale_in = int(request.form['scale'])
+                if not 50 <= scale_in <= 200000:
+                    raise ValueError
+            except ValueError:
+                return jsonify(error='Scale must be a whole number such as 936.'), 400
+        added, errors = [], {}
+        for f in files:
+            name = os.path.basename(f.filename or 'sheet')
+            try:
+                im = Image.open(f.stream)
+                dpi = im.info.get('dpi')
+                im.load()
+                if im.mode in ('RGBA', 'LA', 'P') and ('A' in im.getbands() or 'transparency' in im.info):
+                    im = im.convert('RGBA')
+                    flat = Image.new('RGBA', im.size, (255, 255, 255, 255))
+                    flat.alpha_composite(im)
+                    im = flat
+                gray = im.convert('L')
+                arr = np.asarray(gray)
+                if float(arr.mean()) < 110:                       # white lines on black -> black ink on white
+                    gray = Image.fromarray(255 - arr)
+                    arr = np.asarray(gray)
+                w, h = gray.size
+                stem = os.path.splitext(name)[0] or 'survey'
+                safe = ''.join(ch if ch.isalnum() or ch in '-_.' else '_' for ch in stem)[:100]
+                rid = uuid.uuid4().hex
+                img_file, prev_file = f'{safe}_approved_{rid[:8]}.tif', f'{safe}_approved_{rid[:8]}.png'
+                opts = {'compression': 'tiff_lzw'}
+                save_img = gray
+                if len(np.unique(arr[::7, ::7])) <= 2 and set(np.unique(arr).tolist()) <= {0, 255}:
+                    opts = {'compression': 'group4'}
+                    save_img = gray.point(lambda v: 255 if v > 140 else 0).convert('1')
+                if dpi and min(dpi) > 1:
+                    opts['dpi'] = (float(dpi[0]), float(dpi[1]))
+                save_img.save(os.path.join(approved_dir, img_file), format='TIFF', **opts)
+                prev = gray.copy()
+                prev.thumbnail((1800, 1800), Image.LANCZOS)
+                prev.save(os.path.join(approved_dir, prev_file), format='PNG')
+                meta = {}
+                if len(files) == 1 and survey_in:
+                    meta['survey'] = survey_in
+                else:
+                    m = re.match(r'^(\d+[A-Za-z]?)(?:[ _\-.(].*)?$', stem)
+                    if m:
+                        meta['survey'] = m.group(1)
+                if scale_in:
+                    meta['scale'] = scale_in
+                    meta['scale_source'] = 'manual'
+                record = {'id': rid, 'original_filename': name, 'image_file': img_file, 'preview_file': prev_file,
+                          'width': int(w), 'height': int(h), 'approved_at': datetime.now().astimezone().isoformat(),
+                          'status': 'approved', 'puzzle_status': 'pending_implementation', 'operations': [],
+                          'imported': True, 'meta': meta}
+                _write_json(os.path.join(approved_dir, f'{rid}.json'), record)
+                added.append({'id': rid, 'name': name, 'survey': meta.get('survey')})
+            except Exception as exc:                                   # one bad file must not stop the others
+                errors[name] = f'{type(exc).__name__}: {exc}'
+        if not added:
+            return jsonify(error='No file could be imported. ' + '; '.join(f'{k}: {v}' for k, v in errors.items())), 400
+        return jsonify(ok=True, added=added, errors=errors)
+
     @app.route('/api/board/reset', methods=['POST'])
     def board_reset():
         save_layout(puzzle_dir, {})

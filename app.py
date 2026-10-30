@@ -98,6 +98,8 @@ input[type=checkbox]{accent-color:var(--accent);width:16px;height:16px}
 .toolbar button{padding:8px 12px}
 .toolbar button.active{background:var(--accent);color:#fff;border-color:var(--accent)}
 .preview-wrap{background:repeating-conic-gradient(var(--surface2) 0% 25%,var(--bg) 0% 50%) 50%/20px 20px;border:1px solid var(--line);border-radius:12px;min-height:220px;display:flex;align-items:center;justify-content:center;overflow:auto;padding:10px}
+.qc-bar{display:flex;gap:12px;align-items:center;flex-wrap:wrap;margin:12px 0 4px;padding:10px 12px;border:1px solid var(--line);border-radius:10px;background:var(--surface)}
+.qc-bar.hidden{display:none}
 #editor{display:block;max-width:100%;height:auto;background:#fff;cursor:crosshair;touch-action:none;box-shadow:0 1px 6px rgba(0,0,0,.2)}
 .status{margin-top:12px;white-space:pre-wrap;font-size:14px}
 .status.good,.good{color:var(--ok)}.status.error,.error{color:var(--bad)}
@@ -294,6 +296,7 @@ input[type=file]::file-selector-button{border-radius:6px}
     <button type="button" id="tool-magicline" class="secondary" data-tool="magicline" title="Drag a box around a gap: the broken pieces are joined">✨ Magic line</button>
     <button type="button" id="tool-magicerase" class="secondary" data-tool="magicerase" title="Click a number or a piece of line to remove it">✨ Magic erase</button>
     <button type="button" id="show-original" class="secondary" title="Open the original sheet in a window you can drag aside">Show original</button>
+    <button type="button" id="qc-btn" class="secondary" title="Quality check: the original sheet is shown faintly behind the cleaned map. Click each block to highlight it and tick it off.">QC</button>
     <label id="brush-wrap" class="hidden">Brush size <input id="brush-size" type="range" min="2" max="60" value="14"><span id="brush-value">14</span></label>
     <label id="line-wrap" class="hidden">Line size <input id="line-size" type="range" min="1" max="40" value="4"><span id="line-value">4</span></label>
     <label id="text-wrap" class="hidden">Text <input id="text-value" type="text" maxlength="20" placeholder="e.g. 12A" style="width:90px;padding:4px 6px"> Size <input id="text-size" type="range" min="4" max="40" value="10"><span id="text-size-value">10</span></label>
@@ -303,6 +306,11 @@ input[type=file]::file-selector-button{border-radius:6px}
   </div>
   <p class="hint">Brush erase paints white over unwanted marks. Add line draws a black line between the start and end points. Undo/redo changes your edits. Edits are applied to the full-resolution image when downloading.</p>
   <div class="preview-wrap"><canvas id="editor"></canvas></div>
+  <div id="qc-bar" class="qc-bar hidden">
+    <span id="qc-count" class="muted">QC mode: click a block to highlight it and tick it. Click it again to remove the tick.</span>
+    <button type="button" id="qc-clear" class="secondary">Clear ticks</button>
+    <button type="button" id="qc-approve" class="approve" title="You have inspected the blocks: approve this sheet and send it to the puzzle">Manually approve (send to puzzle)</button>
+  </div>
   <div class="actions">
     <button type="button" class="secondary" id="save-edits" title="Keep your edits for this image (Ctrl/Cmd+S)">Save edits</button>
     <span id="save-state"></span>
@@ -850,12 +858,176 @@ input[type=file]::file-selector-button{border-radius:6px}
     }
   }
 
+  // ---- QC mode: original sheet faintly behind, cleaned map in front, click a block to highlight + tick it
+  let qcMode = false, qcOrig = null, qcTint = null, qcBlocks = [], qcLayer = null, qcWall = null, qcWallKey = '';
+  const QC_COLORS = ['#2e9e5b', '#e0a100', '#d6336c', '#1c7ed6', '#7048e8', '#f76707'];
+  function paintClean(c) {
+    c.drawImage(baseImage, 0, 0);
+    for (const op of operations) drawOperation(c, op);
+    if (activeOperation) drawOperation(c, activeOperation);
+  }
+  function qcMakeTint() {                           // original in a faint red, so everything that was removed stands out
+    if (!qcOrig || !qcOrig.naturalWidth) { qcTint = null; return; }
+    const t = document.createElement('canvas'); t.width = editor.width; t.height = editor.height;
+    const tc = t.getContext('2d'); tc.fillStyle = '#fff'; tc.fillRect(0, 0, t.width, t.height);
+    tc.drawImage(qcOrig, 0, 0, t.width, t.height);
+    const im = tc.getImageData(0, 0, t.width, t.height), d = im.data;
+    for (let i = 0; i < d.length; i += 4) {
+      const ink = 255 - d[i];
+      d[i] = 255 - ink * 0.10; d[i + 1] = 255 - ink * 0.70; d[i + 2] = 255 - ink * 0.70;
+    }
+    tc.putImageData(im, 0, 0); qcTint = t;
+  }
+  function qcDrawBlocks() {
+    for (const b of qcBlocks) {
+      if (!b.canvas) {
+        const c = document.createElement('canvas'); c.width = b.w; c.height = b.h;
+        const cc = c.getContext('2d'), im = cc.createImageData(b.w, b.h);
+        const r = parseInt(b.color.slice(1, 3), 16), g = parseInt(b.color.slice(3, 5), 16), bl = parseInt(b.color.slice(5, 7), 16);
+        for (let i = 0; i < b.mask.length; i++) if (b.mask[i]) { im.data[i * 4] = r; im.data[i * 4 + 1] = g; im.data[i * 4 + 2] = bl; im.data[i * 4 + 3] = 105; }
+        cc.putImageData(im, 0, 0); b.canvas = c;
+      }
+      ctx.drawImage(b.canvas, b.x, b.y);
+      const rad = Math.max(11, Math.min(30, Math.min(b.w, b.h) * 0.16));
+      ctx.save(); ctx.translate(b.cx, b.cy);
+      ctx.beginPath(); ctx.arc(0, 0, rad, 0, Math.PI * 2); ctx.fillStyle = 'rgba(255,255,255,.92)'; ctx.fill();
+      ctx.lineWidth = Math.max(2, rad * 0.18); ctx.strokeStyle = b.color; ctx.stroke();
+      ctx.beginPath(); ctx.moveTo(-0.45 * rad, 0.02 * rad); ctx.lineTo(-0.1 * rad, 0.4 * rad); ctx.lineTo(0.5 * rad, -0.38 * rad);
+      ctx.lineCap = 'round'; ctx.lineJoin = 'round'; ctx.lineWidth = Math.max(2.5, rad * 0.26); ctx.strokeStyle = b.color; ctx.stroke();
+      ctx.restore();
+    }
+  }
+  function qcUpdateBar() {
+    $('qc-count').textContent = qcBlocks.length
+      ? `QC mode: ${qcBlocks.length} block${qcBlocks.length === 1 ? '' : 's'} ticked. Click a block to tick it, click a ticked block to remove the tick.`
+      : 'QC mode: click a block to highlight it and tick it. Click it again to remove the tick.';
+  }
+  function qcWalls() {                              // walls = ink of the cleaned map (+1 px, to close tiny pin-holes)
+    const key = jobId + '|' + operations.length + '|' + redoStack.length + '|' + editor.width;
+    if (qcWall && qcWallKey === key) return qcWall;
+    const W = editor.width, H = editor.height;
+    const lay = document.createElement('canvas'); lay.width = W; lay.height = H;
+    const lc = lay.getContext('2d'); lc.fillStyle = '#fff'; lc.fillRect(0, 0, W, H); paintClean(lc);
+    const d = lc.getImageData(0, 0, W, H).data, wall = new Uint8Array(W * H);
+    for (let i = 0; i < wall.length; i++) wall[i] = d[i * 4] < 230 ? 1 : 0;      // thin lines turn light grey in the shrunken preview, so anything not nearly white is a line
+    const w2 = wall.slice();
+    for (let y = 0; y < H; y++) for (let x = 0; x < W; x++) {
+      if (!wall[y * W + x]) continue;
+      if (x > 0) w2[y * W + x - 1] = 1; if (x < W - 1) w2[y * W + x + 1] = 1;
+      if (y > 0) w2[(y - 1) * W + x] = 1; if (y < H - 1) w2[(y + 1) * W + x] = 1;
+    }
+    qcWall = w2; qcWallKey = key; return w2;
+  }
+  function qcToggle(p) {
+    const W = editor.width, H = editor.height;
+    let sx = Math.max(0, Math.min(W - 1, Math.round(p[0]))), sy = Math.max(0, Math.min(H - 1, Math.round(p[1])));
+    for (let i = 0; i < qcBlocks.length; i++) {      // clicked a ticked block -> remove the tick
+      const b = qcBlocks[i];
+      if (sx >= b.x && sx < b.x + b.w && sy >= b.y && sy < b.y + b.h && b.mask[(sy - b.y) * b.w + (sx - b.x)]) {
+        qcBlocks.splice(i, 1); qcUpdateBar(); renderCanvas(); return;
+      }
+    }
+    const wall = qcWalls();
+    if (wall[sy * W + sx]) {                          // clicked right on a line: use the nearest open spot
+      let found = false;
+      for (let r = 1; r <= 6 && !found; r++) for (let dy = -r; dy <= r && !found; dy++) for (let dx = -r; dx <= r && !found; dx++) {
+        const x = sx + dx, y = sy + dy;
+        if (x >= 0 && y >= 0 && x < W && y < H && !wall[y * W + x]) { sx = x; sy = y; found = true; }
+      }
+      if (!found) return;
+    }
+    const seen = new Uint8Array(W * H), stack = [sx, sy];
+    let x0 = sx, x1 = sx, y0 = sy, y1 = sy, count = 0, onEdge = false;
+    const limit = W * H * 0.35;
+    while (stack.length) {
+      const y = stack.pop(), x = stack.pop();
+      let l = x; while (l > 0 && !wall[y * W + l - 1] && !seen[y * W + l - 1]) l--;
+      let r = x; while (r < W - 1 && !wall[y * W + r + 1] && !seen[y * W + r + 1]) r++;
+      if (wall[y * W + l] || seen[y * W + l]) continue;
+      for (let i = l; i <= r; i++) seen[y * W + i] = 1;
+      count += r - l + 1;
+      if (count > limit) { status(reviewStatus, 'That area is not closed (a gap in the boundary lets it spill over the whole sheet). Close the gap with Add line or Magic line, then click again.', 'error'); return; }
+      if (l < x0) x0 = l; if (r > x1) x1 = r; if (y < y0) y0 = y; if (y > y1) y1 = y;
+      if (l === 0 || r === W - 1 || y === 0 || y === H - 1) onEdge = true;
+      for (const ny of [y - 1, y + 1]) {
+        if (ny < 0 || ny >= H) continue;
+        let i = l;
+        while (i <= r) {
+          if (!wall[ny * W + i] && !seen[ny * W + i]) { stack.push(i, ny); while (i <= r && !wall[ny * W + i]) i++; } else i++;
+        }
+      }
+    }
+    if (onEdge) { status(reviewStatus, 'That is the empty area outside the plots (or a block whose boundary is open to it). Click inside a block.', 'error'); return; }
+    x0 = Math.max(0, x0 - 1); y0 = Math.max(0, y0 - 1); x1 = Math.min(W - 1, x1 + 1); y1 = Math.min(H - 1, y1 + 1);
+    const w = x1 - x0 + 1, h = y1 - y0 + 1, mask = new Uint8Array(w * h);
+    let sxm = 0, sym = 0, n = 0;
+    for (let y = y0; y <= y1; y++) for (let x = x0; x <= x1; x++) {
+      if (seen[y * W + x]) { mask[(y - y0) * w + (x - x0)] = 1; sxm += x; sym += y; n++; }
+    }
+    const m2 = mask.slice();                           // grow by 1 px so the colour reaches the lines
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      if (!mask[y * w + x]) continue;
+      if (x > 0) m2[y * w + x - 1] = 1; if (x < w - 1) m2[y * w + x + 1] = 1;
+      if (y > 0) m2[(y - 1) * w + x] = 1; if (y < h - 1) m2[(y + 1) * w + x] = 1;
+    }
+    let cx = sxm / n, cy = sym / n;                    // tick position: the filled pixel nearest the centre of the block
+    if (!mask[Math.round(cy - y0) * w + Math.round(cx - x0)]) {
+      let best = 1e18;
+      for (let y = y0; y <= y1; y += 2) for (let x = x0; x <= x1; x += 2) {
+        if (mask[(y - y0) * w + (x - x0)]) { const dd = (x - cx) * (x - cx) + (y - cy) * (y - cy); if (dd < best) { best = dd; sx = x; sy = y; } }
+      }
+      cx = sx; cy = sy;
+    }
+    qcBlocks.push({x: x0, y: y0, w, h, mask: m2, cx, cy, color: QC_COLORS[qcBlocks.length % QC_COLORS.length], canvas: null});
+    qcUpdateBar(); renderCanvas();
+  }
+  function qcSetMode(on) {
+    qcMode = on;
+    if (on && tool !== 'pan') selectTool('pan');       // ticking works with the View tool, so QC switches to it
+    $('qc-btn').classList.toggle('active', on);
+    $('qc-bar').classList.toggle('hidden', !on);
+    editor.style.cursor = on && tool === 'pan' ? 'pointer' : (tool === 'pan' ? 'default' : 'crosshair');
+    if (on && jobId) {
+      qcUpdateBar();
+      status(reviewStatus, 'QC: the original is shown faintly in red behind the cleaned map. Red marks that are not black were removed by the cleaning. Click each block to highlight it and tick it.');
+      if (!qcOrig) {
+        const im = new Image();
+        im.onload = () => { qcOrig = im; qcMakeTint(); renderCanvas(); };
+        im.onerror = () => { qcOrig = null; status(reviewStatus, 'The original is not available for this file, so QC shows only the cleaned map.', 'error'); };
+        im.src = `/job/${jobId}/original?t=` + Date.now();
+      } else if (!qcTint) qcMakeTint();
+    }
+    renderCanvas();
+  }
+  function qcReset() {                              // a different image was opened
+    qcOrig = null; qcTint = null; qcBlocks = []; qcWall = null; qcWallKey = '';
+    if (qcMode) qcSetMode(false);
+  }
+  $('qc-btn').addEventListener('click', () => { if (!jobId) return; qcSetMode(!qcMode); });
+  $('qc-clear').addEventListener('click', () => { qcBlocks = []; qcUpdateBar(); renderCanvas(); });
+  editor.addEventListener('click', event => { if (qcMode && jobId && tool === 'pan') qcToggle(canvasPoint(event)); });
+  $('qc-approve').addEventListener('click', () => {
+    if (!jobId) return;
+    if (!qcBlocks.length && !window.confirm('No block has been ticked yet. Approve this sheet and send it to the puzzle anyway?')) return;
+    $('approve').click();
+  });
+
   function renderCanvas() {
     if (!baseImage) return;
     ctx.clearRect(0, 0, editor.width, editor.height);
-    ctx.drawImage(baseImage, 0, 0);
-    for (const op of operations) drawOperation(ctx, op);
-    if (activeOperation) drawOperation(ctx, activeOperation);
+    if (qcMode) {
+      if (!qcLayer) qcLayer = document.createElement('canvas');
+      if (qcLayer.width !== editor.width || qcLayer.height !== editor.height) { qcLayer.width = editor.width; qcLayer.height = editor.height; }
+      const lc = qcLayer.getContext('2d'); lc.fillStyle = '#fff'; lc.fillRect(0, 0, qcLayer.width, qcLayer.height); paintClean(lc);
+      ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, editor.width, editor.height);
+      if (qcTint) ctx.drawImage(qcTint, 0, 0);
+      ctx.save(); ctx.globalCompositeOperation = 'multiply'; ctx.drawImage(qcLayer, 0, 0); ctx.restore();
+      qcDrawBlocks();
+    } else {
+      ctx.drawImage(baseImage, 0, 0);
+      for (const op of operations) drawOperation(ctx, op);
+      if (activeOperation) drawOperation(ctx, activeOperation);
+    }
     if (magicRect) {
       ctx.save(); ctx.setLineDash([8, 5]); ctx.lineWidth = 2; ctx.strokeStyle = '#1769e0'; ctx.fillStyle = 'rgba(23,105,224,.10)';
       const rx = Math.min(magicRect.x0, magicRect.x1), ry = Math.min(magicRect.y0, magicRect.y1), rw = Math.abs(magicRect.x1 - magicRect.x0), rh = Math.abs(magicRect.y1 - magicRect.y0);
@@ -918,9 +1090,11 @@ input[type=file]::file-selector-button{border-radius:6px}
     $('line-wrap').classList.toggle('hidden', tool !== 'line');
     $('text-wrap').classList.toggle('hidden', tool !== 'text');
     if (tool === 'text') { status(reviewStatus, 'Add text: type the plot number, then click on the sheet where it belongs. The text is centred on your click. Undo if it is off.'); setTimeout(() => $('text-value').focus(), 0); }
-    editor.style.cursor = tool === 'pan' ? 'default' : 'crosshair';
+    editor.style.cursor = tool === 'pan' ? (qcMode ? 'pointer' : 'default') : 'crosshair';
     if (tool === 'magicline') status(reviewStatus, 'Magic line: drag a box around the gap. Cover a bit of both broken pieces.');
     if (tool === 'magicerase') status(reviewStatus, 'Magic erase: click on a number or on a stray piece of line to remove it.');
+    if (qcMode && tool !== 'pan') status(reviewStatus, 'QC is on, but ticking is paused while an edit tool is selected. Choose View to tick blocks again; the edits you make show up in the QC view.');
+    else if (qcMode) status(reviewStatus, 'QC: click a block to highlight it and tick it. Click a ticked block to remove the tick.');
   }
   document.querySelectorAll('[data-tool]').forEach(btn => btn.addEventListener('click', () => selectTool(btn.dataset.tool)));
 
@@ -1016,6 +1190,7 @@ input[type=file]::file-selector-button{border-radius:6px}
   function openReview(data) {
     if (data.job_id === jobId && !reviewPanel.classList.contains('hidden')) { reviewPanel.scrollIntoView({behavior:'smooth', block:'start'}); return; }
     if (!confirmDiscard()) return;
+    qcReset();
     jobId = data.job_id;
     if (!$('orig-win').classList.contains('hidden')) setTimeout(() => { $('orig-title').textContent = 'Original — ' + data.filename; $('orig-img').src = `/job/${data.job_id}/original?t=` + Date.now(); }, 0);
     previewWidth = data.preview_width; previewHeight = data.preview_height;
@@ -1324,7 +1499,7 @@ input[type=file]::file-selector-button{border-radius:6px}
 
   $('new-image').addEventListener('click', () => {
     if (!confirmDiscard()) return;
-    origWin.classList.add('hidden');
+    origWin.classList.add('hidden'); qcReset();
     jobId = null; baseImage = null; operations = []; redoStack = [];
     reviewPanel.classList.add('hidden'); approvedPanel.classList.add('hidden');
     uploadPanel.classList.remove('hidden'); fileInput.value = '';

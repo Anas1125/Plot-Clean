@@ -34,6 +34,7 @@ def _find_zone(lab, st, frames, H, W, s, log):
     bot = y + h - int(700*s)
     return top, bot, x, x + w
 
+DEBUG_PN = False
 BIG_PX = 150_000_000          # sheets above this are cleaned on a ~139 M px copy, then mapped back to full size
 TARGET_PX = 139_000_000
 
@@ -120,15 +121,18 @@ def _clean_core(im, log=print, debug=False, P=lambda p, m='': None, extra=None):
     kept_poly = 0
     block_poly = []                                   # multi-cell parcel blocks: cleaned like the network
     for (i, x, y, w, h, a) in small_free:
-        if min(w, h) < S(150) or max(w, h) > S(1500): continue      # was S(260): thin parcel pairs (e.g. 95/98 on sheet 7, 305 px tall) were thrown away
+        if min(w, h) < S(100) or max(w, h) > S(1500): continue      # was S(260), then S(150): a small single parcel such as 112 on sheet 7 is only ~190 px wide: thin parcel pairs (e.g. 95/98 on sheet 7, 305 px tall) were thrown away
         sub = (lab[y:y+h, x:x+w] == i).astype(np.uint8)
         cnts, hier = cv2.findContours(sub, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
         # real cells only: the pinholes where a dash touches the outline are not plots
+        # area of the shape itself (filled silhouette), NOT of its bounding box: a tilted parcel block fills only ~20 % of
+        # its bounding box, which made whole blocks (e.g. 85|64|73 on sheet 20) look like "not a polygon" and vanish
+        hull_a = max(1.0, max(cv2.contourArea(cnts[k]) for k in range(len(cnts)) if hier[0][k][3] < 0))   # filled silhouette; a dash stub touching the block must not inflate it
         sig = [cv2.contourArea(cnts[k]) for k in range(len(cnts))
-               if hier[0][k][3] >= 0 and cv2.contourArea(cnts[k]) > max(0.02*w*h, S(60)**2)]
-        if len(sig) == 1 and sig[0] > 0.35*w*h:          # one big hole = polygon, not an icon
+               if hier[0][k][3] >= 0 and cv2.contourArea(cnts[k]) > max(0.02*hull_a, S(60)**2)]
+        if len(sig) == 1 and sig[0] > 0.35*hull_a:       # one big hole = polygon, not an icon
             block_poly.append(i); kept_poly += 1
-        elif len(sig) >= 1 and sum(sig) > 0.3*w*h:
+        elif len(sig) >= 1 and sum(sig) > 0.3*hull_a:
             block_poly.append(i)                          # several cells / a block with attachments: clean like the network
         elif not sig:
             # an outline with a small gap (a label or a dash cut it): closed by a short bridge it encloses a parcel
@@ -137,7 +141,7 @@ def _clean_core(im, log=print, debug=False, P=lambda p, m='': None, extra=None):
             cl = cv2.morphologyEx(cv2.copyMakeBorder(sub, pad_, pad_, pad_, pad_, cv2.BORDER_CONSTANT, value=0), cv2.MORPH_CLOSE, k_)
             cc, hh = cv2.findContours(cl, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
             hs = [cv2.contourArea(cc[k]) for k in range(len(cc)) if hh[0][k][3] >= 0]
-            if hs and max(hs) > 0.35*w*h: block_poly.append(i)
+            if hs and max(hs) > 0.35*hull_a: block_poly.append(i)
     for i in block_poly:
         keep[i] = True; network.append(i)
     log(f'  isolated polygons kept: {kept_poly}, multi-cell blocks: {len(block_poly)}')
@@ -179,7 +183,7 @@ def _clean_core(im, log=print, debug=False, P=lambda p, m='': None, extra=None):
         if i in block_poly_set:
             # a free parcel block: its OUTER outline is the boundary. Whatever cleaning removed from that outline
             # (a dash line lying along an edge, a crossing arrow) is put back so the parcel stays closed.
-            cleaned = _close_open_outline(cleaned | _outer_ring(reg), s)
+            cleaned = _close_open_outline(cleaned | _outer_ring(reg), s, txt_crop, log)
         sub = m[y0:y1, x0:x1]
         sub[cv2.dilate(reg.astype(np.uint8), np.ones((5, 5), np.uint8)) > 0] = False
         sub |= cleaned
@@ -264,7 +268,7 @@ def _clean_core(im, log=print, debug=False, P=lambda p, m='': None, extra=None):
     foot = _footer_keep(cm, bot, H, W, zx1, s)
     # --- plot numbers from the blue text ---
     P(90, 'Detecting plot numbers')
-    kept_blue = _plot_numbers(cm, s, log)
+    kept_blue = _plot_numbers(cm, s, log, m)
     P(96, 'Writing the cleaned image')
     if extra is not None: extra['healed'] = healed
     m |= cv2.dilate(kept_blue.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
@@ -288,7 +292,7 @@ def _clean_core(im, log=print, debug=False, P=lambda p, m='': None, extra=None):
     return res
 
 
-def _close_open_outline(cl, s):
+def _close_open_outline(cl, s, txt=None, log=print):
     """cl: cleaned ink of one free parcel block. An outline left open (a corner hidden under labels) is closed:
     two free ends whose straight continuations meet at a corner, or face each other, are joined."""
     from skimage.morphology import skeletonize
@@ -327,15 +331,28 @@ def _close_open_outline(cl, s):
                 except np.linalg.LinAlgError: continue
                 if not (0 < t1 < Dmax and 0 < t2 < Dmax): continue
                 Pc = e1 + u1*t1
+                if txt is not None: log(f'    corner bridge legs {t1:.0f}/{t2:.0f}px, text cover {_text_cover(txt, e1, Pc, s):.2f}/{_text_cover(txt, e2, Pc, s):.2f}')
                 cv2.line(canvas, tuple(int(round(v)) for v in e1), tuple(int(round(v)) for v in Pc), 1, wid)
                 cv2.line(canvas, tuple(int(round(v)) for v in e2), tuple(int(round(v)) for v in Pc), 1, wid)
                 used.add(a_); used.add(b_)
             elif cosang > 0.97:                                 # facing each other along one line
                 d = e2 - e1; dl = np.hypot(*d)
                 if dl > Dmax or (d @ u1) / dl < 0.95 or (-d @ u2) / dl < 0.95: continue
+                cov = _text_cover(txt, e1, e2, s) if txt is not None else -1
+                log(f'    facing-ends bridge len {dl:.0f}px ({dl/S(1):.0f} u), text cover {cov:.2f}')
                 cv2.line(canvas, tuple(int(round(v)) for v in e1), tuple(int(round(v)) for v in e2), 1, wid)
                 used.add(a_); used.add(b_)
     return out | (canvas > 0)
+
+def _text_cover(txt, p, q, s):
+    """fraction of the straight path p->q that runs through (or right beside) printed text"""
+    S = lambda v: max(1, int(round(v*s)))
+    n = max(2, int(np.hypot(*(q - p))/2))
+    r = S(6); ok = 0
+    for t in np.linspace(0, 1, n):
+        x, y = p + (q - p)*t; x = int(round(x)); y = int(round(y))
+        ok += bool(txt[max(y-r, 0):y+r+1, max(x-r, 0):x+r+1].any())
+    return ok / n
 
 def _outer_ring(reg):
     """ink of `reg` forming the outer outline of the shape, WITHOUT thin things sticking out of it (arrows, ticks):
@@ -458,6 +475,24 @@ def _footer_keep(cm, bot, H, W, zx1, s):
     keep = ok[lab] & (band > 0)
     return cv2.dilate(keep.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
 
+def _parallel_neighbour(ms, p, q, s):
+    """share of the middle of the path p->q that has kept linework running beside it (0.5-2.5 text heights away)"""
+    S = lambda v: max(1, int(round(v*s)))
+    d_ = q - p; L = float(np.hypot(*d_))
+    if L < 1: return 0.0
+    u = d_ / L; nrm = np.array([-u[1], u[0]])
+    hit = tot = 0
+    for t in np.linspace(0.15, 0.85, max(6, int(L/4))):
+        c = p + d_*t; tot += 1; found = False
+        for sg in (-1, 1):
+            for dd in range(S(14), S(40) + 1, 2):
+                px, py = c + nrm*sg*dd; px = int(round(px)); py = int(round(py))
+                if 0 <= py < ms.shape[0] and 0 <= px < ms.shape[1] and ms[max(py-1, 0):py+2, max(px-1, 0):px+2].any():
+                    found = True; break
+            if found: break
+        hit += found
+    return hit / tot
+
 def _join_under_labels(m, cm, s, log):
     """A line (or a plot corner) hidden under a run of labels is longer than one label, so the per-label heal
     cannot close it. Look at the free ends of the kept linework that stop at printed text and
@@ -533,7 +568,11 @@ def _join_under_labels(m, cm, s, log):
             ds = np.arange(0, hit, 2)
             ptx = np.array([[int(round((e + u*d)[0])), int(round((e + u*d)[1]))] for d in ds])
             ok = np.mean([tx_d[min(max(p[1], 0), tx_d.shape[0]-1), min(max(p[0], 0), tx_d.shape[1]-1)] for p in ptx])
-            if ok >= 0.5:
+            par_ = _parallel_neighbour(ms, e, e + u*hit, s) if (ok >= 0.5 and hit > S(100)) else 0.0   # a short gap is just one label wide: always a hidden line
+            log(f'    under-label join at ({e[0]+x0:.0f},{e[1]+y0:.0f}) len {hit}px text cover {ok:.2f} parallel-line {par_:.2f}')
+            # the label is explained by ANOTHER line running right beside the gap (a stepped boundary: the dimension
+            # sits above its own edge, and the neighbouring edges only look collinear): nothing is hidden here
+            if ok >= 0.5 and par_ < 0.4:
                 lines.append((e, e + u*hit)); used.add(k)
         if lines:
             canvas = np.zeros(ms.shape, np.uint8)
@@ -596,13 +635,32 @@ def _heal_under_labels(m, cm, s, log):
     log(f'  healed {cnt} labels sitting on lines')
     return out
 
-def _plot_numbers(cm, s, log):
+def _plot_numbers(cm, s, log, m=None):
     """Plot names are usually printed larger than the dimension digits, but some are printed in the SAME size
     (survey 61: 2, 5, 4A are large; 1A, 1B, 4B, 7 are dimension-sized). So take both: the larger-than-dimension
     strings, and the same-size strings that are upright, horizontal and have no decimal point."""
-    kept = _plot_numbers_pass(cm, s, log, 1.10)
+    kept = _plot_numbers_pass(cm, s, log, 1.10, m)
     log('  also looking for plot names printed in the dimension size')
-    return kept | _plot_numbers_pass(cm, s, log, 0.85)
+    loose = _plot_numbers_pass(cm, s, log, 0.85, m) & ~kept
+    if m is not None and kept.any() and loose.any():
+        # one name per parcel: where a parcel already carries a name printed LARGER than the dimensions, extra
+        # dimension-sized strings inside the same closed parcel are dimensions, not a second name
+        f = 4
+        Hs, Ws = m.shape
+        ms_ = cv2.resize(m.astype(np.uint8), (max(1, Ws//f), max(1, Hs//f)), interpolation=cv2.INTER_AREA) > 0
+        ms_ = cv2.dilate(ms_.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+        nc, cl_ = cv2.connectedComponents((~ms_).astype(np.uint8), connectivity=4)
+        edge = np.unique(np.concatenate([cl_[0], cl_[-1], cl_[:, 0], cl_[:, -1]]))     # cells open to the sheet edge: unreliable
+        ks = cv2.resize(kept.astype(np.uint8), (cl_.shape[1], cl_.shape[0]), interpolation=cv2.INTER_AREA) > 0
+        named = np.unique(cl_[ks]); named = named[(named > 0) & ~np.isin(named, edge)]
+        nl, ll, sl, cen = cv2.connectedComponentsWithStats(loose.astype(np.uint8), connectivity=8)
+        drop = np.zeros(nl, bool)
+        for q in range(1, nl):
+            cid = cl_[min(int(cen[q][1])//f, cl_.shape[0]-1), min(int(cen[q][0])//f, cl_.shape[1]-1)]
+            if cid in set(named.tolist()): drop[q] = True
+        log(f'  dimension-sized strings dropped because their parcel already has a name: {int(drop.sum())} of {nl-1} glyphs')
+        loose = ~drop[ll] & loose if nl > 1 else loose
+    return kept | loose
 
 def _text_unit(sz, a, s):
     """Height in px of a typical dimension digit on THIS sheet = the most common size among blue glyph-like
@@ -617,7 +675,7 @@ def _text_unit(sz, a, s):
     v = np.arange(len(hist))[lo:hi]; wgt = hist[lo:hi]
     return float((v*wgt).sum() / max(1, wgt.sum()))
 
-def _plot_numbers_pass(cm, s, log, thr_f):
+def _plot_numbers_pass(cm, s, log, thr_f, m=None):
     blue = (cm == BLUE).astype(np.uint8)
     n, lab, st, _ = cv2.connectedComponentsWithStats(blue, connectivity=8, ltype=cv2.CV_16U)
     del blue
@@ -747,6 +805,23 @@ def _plot_numbers_pass(cm, s, log, thr_f):
             # overlapping dimension text (several numbers on top of each other) is clutter, not a plot name.
             d_ = np.hypot(cx - (x[mem] + w[mem]/2).mean(), cy - (y[mem] + h[mem]/2).mean())
             if int(((d_ <= 2.0*H1) & ~np.isin(gs, mem)).sum()) >= 7: continue
+            # a dimension is printed ON / right beside the boundary it measures; a plot name stands in the middle of
+            # its parcel. Dimension-sized text that hugs kept linework is a dimension (digits overlapped so the
+            # decimal point is hidden, e.g. 10.9 over 19, are the usual survivors).
+            if m is not None:
+                p_ = int(round(0.6*H1))
+                bx0 = int((x[mem]).min()) - p_; by0 = int((y[mem]).min()) - p_
+                bx1 = int((x[mem] + w[mem]).max()) + p_; by1 = int((y[mem] + h[mem]).max()) + p_
+                win = m[max(by0, 0):by1, max(bx0, 0):bx1]
+                if int(win.sum()) >= 1.0*H1: continue
+        elif m is not None and (sz[mem].max() > 1.9*H1 or (len(mem) == 1 and w[mem[0]] > 1.25*h[mem[0]])):
+            # a blob taller / wider than any single glyph with a boundary running through or right beside it is two or more
+            # dimension labels printed on top of each other (1682, 127. ...), not a plot name
+            p_ = max(1, int(round(1.0*H1)))               # dimensions sit up to ~1.3 text heights from the line they measure
+            bx0 = int((x[mem]).min()) - p_; by0 = int((y[mem]).min()) - p_
+            bx1 = int((x[mem] + w[mem]).max()) + p_; by1 = int((y[mem] + h[mem]).max()) + p_
+            if int(m[max(by0, 0):by1, max(bx0, 0):bx1].sum()) >= 1.0*H1: continue
+        if DEBUG_PN: log(f'    KEEP thr={thr_f} at ({(x[mem]+w[mem]/2).mean():.0f},{(y[mem]+h[mem]/2).mean():.0f}) n={len(mem)} w={w[mem].tolist()} h={h[mem].tolist()} fill={[round(float(v),2) for v in fill]}')
         keep_ids.extend((mem + 1).tolist())
     kept_roots = {root[np.nonzero(gs == (k - 1))[0][0]] for k in keep_ids if (k - 1) in set(gs.tolist())}
     for ii, nb in slashes:
