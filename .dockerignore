@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+approved_images/
+*.tif
+*.png
+.git/
+venv/
+.DS_Store

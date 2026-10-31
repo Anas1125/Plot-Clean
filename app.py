@@ -392,7 +392,7 @@ input[type=file]::file-selector-button{border-radius:6px}
           title.textContent = (item.order ? '#' + item.order + ' · ' : '') + item.filename;
           const meta = document.createElement('p');
           meta.className = 'meta';
-          meta.textContent = `${item.width.toLocaleString()} × ${item.height.toLocaleString()} px · Approved ${new Date(item.approved_at).toLocaleString()}`;
+          meta.textContent = `${item.width.toLocaleString()} × ${item.height.toLocaleString()} px · ${item.manual_approved ? 'Manually approved' : 'Approved'} ${new Date(item.approved_at).toLocaleString()}`;
           const note = document.createElement('p');
           note.className = 'meta';
           note.textContent = item.puzzle_note || 'Status: Approved · not in a puzzle yet';
@@ -1006,9 +1006,11 @@ input[type=file]::file-selector-button{border-radius:6px}
   $('qc-btn').addEventListener('click', () => { if (!jobId) return; qcSetMode(!qcMode); });
   $('qc-clear').addEventListener('click', () => { qcBlocks = []; qcUpdateBar(); renderCanvas(); });
   editor.addEventListener('click', event => { if (qcMode && jobId && tool === 'pan') qcToggle(canvasPoint(event)); });
+  let approveManual = false;
   $('qc-approve').addEventListener('click', () => {
     if (!jobId) return;
     if (!qcBlocks.length && !window.confirm('No block has been ticked yet. Approve this sheet and send it to the puzzle anyway?')) return;
+    approveManual = true;                           // tells the Approve handler this one was checked by hand in QC
     $('approve').click();
   });
 
@@ -1392,13 +1394,14 @@ input[type=file]::file-selector-button{border-radius:6px}
   });
 
   $('approve').addEventListener('click', async () => {
-    if (!jobId) return;
+    if (!jobId) { approveManual = false; return; }
+    const manual = approveManual, qcTicked = manual ? qcBlocks.length : 0; approveManual = false;
     const button = $('approve'); button.disabled = true; const jobIdAtClick = jobId;
     status(reviewStatus, 'Saving approval…');
     try {
       const response = await fetch(`/job/${jobId}/approve`, {
         method:'POST', headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({operations})
+        body:JSON.stringify({operations, manual, qc_ticked: qcTicked})
       });
       const data = await response.json();
       if (!response.ok) throw new Error(data.error || 'Approval failed.');
@@ -2227,6 +2230,7 @@ def list_approved():
             "width": record["width"],
             "height": record["height"],
             "approved_at": record["approved_at"],
+            "manual_approved": bool(record.get("manual_approved")),
             "preview_url": url_for("approved_preview", item_id=item_id),
             "download_url": url_for("approved_download", item_id=item_id),
         })
@@ -2254,6 +2258,12 @@ def approved_download(item_id):
 def approve_job(job_id):
     job = _get_job(job_id)
     operations = _get_operations()
+    body = request.get_json(silent=True) or {}
+    manual_approved = bool(body.get("manual"))          # approved with the QC "Manually approve" button
+    try:
+        qc_ticked = max(0, int(body.get("qc_ticked") or 0))
+    except (TypeError, ValueError):
+        qc_ticked = 0
     final_image = _apply_operations(_job_base(job), operations, job["preview_width"], job["preview_height"])
     approved_id = uuid.uuid4().hex
     base = os.path.splitext(job["filename"])[0] or "survey"
@@ -2287,6 +2297,8 @@ def approve_job(job_id):
             "approved_at": approved_at,
             "status": "approved",
             "puzzle_status": "pending_implementation",
+            "manual_approved": manual_approved,
+            "qc_ticked": qc_ticked,
             "operations": operations,
         }
         with open(metadata_path, "w", encoding="utf-8") as stream:

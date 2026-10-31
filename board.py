@@ -472,7 +472,9 @@ def register(app, approved_records, approved_dir, puzzle_dir):
             return jsonify(state='preparing', done=snap['done'], total=snap['total'], message=snap['message'])
         pieces = load_pieces(items)
         layout = load_layout(puzzle_dir)
-        order = {r['id']: i for i, r in enumerate(sorted(approved_records(), key=lambda r: (r.get('approved_at', ''), r.get('id', ''))))}
+        recs = approved_records()
+        manual_ids = {r['id'] for r in recs if r.get('manual_approved')}
+        order = {r['id']: i for i, r in enumerate(sorted(recs, key=lambda r: (r.get('approved_at', ''), r.get('id', ''))))}
         pieces.sort(key=lambda p: order.get(p['id'], 0))
         defaults = default_positions(pieces, layout)
         out = []
@@ -485,6 +487,7 @@ def register(app, approved_records, approved_dir, puzzle_dir):
                         'sz_saved': lay.get('sz'),
                         'placed': bool(lay.get('placed', 'x' in lay)),
                         'locked': bool(lay.get('locked', False)),
+                        'manual': p['id'] in manual_ids,
                         'color': lay.get('color') or color_for(order.get(p['id'], i)),
                         'img': f"/board/piece/{p['id']}.png?v={p['sig'][1]}",
                         'clean': f"/approved/{p['id']}/preview", 'download': f"/approved/{p['id']}/download",

@@ -1149,7 +1149,7 @@
     if (!selected) { selBar.classList.add('hidden'); return; }
     selBar.classList.remove('hidden');
     if (pieceLockBtn) { pieceLockBtn.textContent = selected.locked ? '🔒 Unlock piece' : '🔓 Lock piece'; pieceLockBtn.classList.toggle('on', !!selected.locked); }
-    selName.textContent = 'S.' + selected.survey + ' · ' + (selected.name || '');
+    selName.textContent = pieceTitle(selected);
     selColor.value = selected.color;
     if (selSize) selSize.value = selected.sz.toFixed(2);
   }
@@ -1213,10 +1213,12 @@
     return null;
   }
   let viewerPiece = null, plotLblBox = null;
+  const MAN_TAG = '  ·  ✔ Manually approved';
+  const pieceTitle = p => 'S.' + p.survey + ' · ' + (p.name || '') + (p.manual ? MAN_TAG : '');
   function showViewerImage() {
     const p = viewerPiece; if (!p) return;
     const lab = !plotLblBox || plotLblBox.checked;                // S2-1 style labels (default) or the original numbers
-    modalTitle.textContent = 'S.' + p.survey + ' · ' + (p.name || '');
+    modalTitle.textContent = pieceTitle(p);
     modalDl.href = lab ? `/board/labelled/${p.id}/download` : p.download;
     modalDl.textContent = lab ? 'Download TIFF (S' + p.survey + '-N)' : 'Download TIFF';
     modalImg.alt = 'Cleaned survey sheet';
@@ -1226,11 +1228,11 @@
       const url = `/board/labelled/${p.id}/preview`;
       fetch(url).then(r => { if (!r.ok) throw new Error(); return r.blob(); }).then(b => {
         if (viewerPiece !== p) return;
-        modalTitle.textContent = 'S.' + p.survey + ' · ' + (p.name || '');
+        modalTitle.textContent = pieceTitle(p);
         modalImg.src = URL.createObjectURL(b);
       }).catch(() => {                                             // could not label: fall back to the plain cleaned image
         if (viewerPiece !== p) return;
-        modalTitle.textContent = 'S.' + p.survey + ' · ' + (p.name || '') + '  (plot labels unavailable)';
+        modalTitle.textContent = pieceTitle(p) + '  (plot labels unavailable)';
         modalImg.src = p.clean + '?t=' + Date.now(); modalDl.href = p.download;
       });
     } else modalImg.src = p.clean + '?t=' + Date.now();
